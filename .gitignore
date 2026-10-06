@@ -20,3 +20,5 @@ tmp_clips/
 .DS_Store
 .vscode/
 .idea/
+
+local_data/
