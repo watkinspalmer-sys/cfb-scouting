@@ -43,5 +43,14 @@ def extract_clip(
         str(destination),
     ]
 
-    subprocess.run(command, check=True, capture_output=True)
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "Unknown FFmpeg error").strip()
+        raise RuntimeError(detail)
+
     return str(destination)
