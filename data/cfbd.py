@@ -27,7 +27,12 @@ def fetch_plays(team, year, last_week, api_key):
         response.raise_for_status()
         data = response.json()
         if data:
-            frames.append(pd.DataFrame(data))
+            frame = pd.DataFrame(data)
+            # CFBD play payloads do not always include the requested week.
+            # Preserve it explicitly so downstream game/film pages can filter
+            # the multi-week fetch reliably.
+            frame["_requested_week"] = week
+            frames.append(frame)
 
     if not frames:
         return pd.DataFrame()
