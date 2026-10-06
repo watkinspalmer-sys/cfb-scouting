@@ -155,8 +155,15 @@ def main():
     st.subheader("1. Extract a short clip")
 
     video_path = Path(video_path_text).expanduser() if video_path_text else None
-    if video_path_text and not video_path.exists():
-        st.warning("That video path does not exist on this computer.")
+    if video_path_text:
+        if not video_path.exists():
+            st.warning("That video path does not exist on this computer.")
+        elif not video_path.is_file():
+            st.warning(
+                "That path points to a folder, not a video file. "
+                "Paste the full path to the actual video, including its filename "
+                "and extension such as .mp4, .mkv, or .mov."
+            )
 
     t1, t2 = st.columns(2)
     start_text = t1.text_input(
@@ -181,6 +188,11 @@ def main():
             st.error("Enter the local video path first.")
         elif not video_path.exists():
             st.error("The local video path could not be found.")
+        elif not video_path.is_file():
+            st.error(
+                "The selected path is a folder. Choose the actual video file "
+                "(for example C:\\Users\\palme\\Videos\\game.mp4)."
+            )
         else:
             try:
                 start_seconds = parse_timecode(start_text)
