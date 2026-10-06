@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Large local football video files
+*.mp4
+*.mov
+*.mkv
+*.avi
+video_files/
+clips/
+tmp_clips/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
