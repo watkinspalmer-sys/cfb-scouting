@@ -18,10 +18,28 @@ def get_key():
         return None
 
 
+def _format_clock(value) -> str:
+    """Normalize CFBD clock values such as {'minutes': 12, 'seconds': 59}."""
+    if isinstance(value, dict):
+        minutes = value.get("minutes")
+        seconds = value.get("seconds")
+        if minutes is not None and seconds is not None:
+            return f"{int(minutes)}:{int(seconds):02d}"
+    return str(value)
+
+
 def _safe_text(row: pd.Series, *names: str, default: str = "") -> str:
     for name in names:
-        if name in row.index and pd.notna(row[name]):
-            return str(row[name])
+        if name in row.index:
+            value = row[name]
+            if name == "clock" and isinstance(value, dict):
+                return _format_clock(value)
+            try:
+                if pd.notna(value):
+                    return str(value)
+            except (TypeError, ValueError):
+                if value is not None:
+                    return str(value)
     return default
 
 
@@ -85,11 +103,16 @@ def main():
         st.warning("No plays returned for this team/week.")
         st.stop()
 
-    # Narrow the week-level fetch to the selected week because fetch_plays downloads 1..week.
-    if "week" in plays.columns:
-        week_plays = plays[pd.to_numeric(plays["week"], errors="coerce").eq(int(week))].copy()
-        if not week_plays.empty:
-            plays = week_plays
+    # fetch_plays downloads weeks 1..selected week. Use the explicit marker
+    # added by data.cfbd because CFBD play payloads may omit a week field.
+    if "_requested_week" in plays.columns:
+        plays = plays[
+            pd.to_numeric(plays["_requested_week"], errors="coerce").eq(int(week))
+        ].copy()
+    elif "week" in plays.columns:
+        plays = plays[
+            pd.to_numeric(plays["week"], errors="coerce").eq(int(week))
+        ].copy()
 
     if "offense" in plays.columns:
         side = st.radio("Chart", ["Tulsa offense", "Tulsa defense"], horizontal=True)
@@ -99,6 +122,13 @@ def main():
             filtered = plays[plays["defense"].astype(str).eq(team.strip())].copy()
     else:
         filtered = plays.copy()
+
+    # Film Lab v1 is for scrimmage scouting, not special teams.
+    if "playType" in filtered.columns:
+        scrimmage = filtered["playType"].astype(str).str.contains(
+            r"Rush|Pass|Sack", case=False, na=False, regex=True
+        )
+        filtered = filtered[scrimmage].copy()
 
     if filtered.empty:
         st.warning("No matching plays found for this side of the ball.")
