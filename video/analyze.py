@@ -10,7 +10,7 @@ from google import genai
 from pydantic import BaseModel, Field
 
 from models.schemas import FilmObservation
-from video.frames import create_temporal_evidence_sheets, extract_temporal_frames_v31
+from video.frames import create_temporal_evidence_sheets, extract_temporal_frames_v31, extract_snap_centered_frames_v34
 
 
 class VideoAnalyzer(Protocol):
@@ -138,6 +138,17 @@ class TemporalDiagnosticV32(BaseModel):
     evidence_notes: str
 
 
+
+
+
+
+class SnapLocatorV34(BaseModel):
+    """Minimal coarse pass used only to estimate the snap timestamp."""
+
+    snap_frame_index: int = Field(ge=1, le=12)
+    snap_timestamp_seconds: float = Field(ge=0)
+    confidence: float = Field(ge=0, le=1)
+    evidence_notes: str
 
 
 class TemporalPreSnapV33(BaseModel):
@@ -963,6 +974,147 @@ PRESSURE AND COVERAGE:
 Make a best visual football judgment rather than returning blank fields.
 CFBD play-by-play is outcome context only and cannot decide concept, rushers, pressure, or coverage.
 In evidence_notes cite FRAME numbers supporting the play type, each rusher, and coverage rotation.
+"""
+
+
+
+
+def _snap_locator_prompt_v34(play_context: dict, evidence: dict) -> str:
+    context = _context(play_context)
+    frame_map = "\n".join(
+        f"FRAME {item['frame_index']:02d} = {item['timestamp_seconds']:.2f}s"
+        for item in evidence.get("frames", [])
+    )
+    return f"""
+You are locating ONLY the snap in one college football play.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+You receive 12 chronological coarse frames from the same clip.
+
+Timeline:
+{frame_map}
+
+Your only task:
+- identify the frame nearest the instant the center snaps the ball
+- return that frame number
+- return the exact timestamp shown for that frame
+- give a confidence score
+- briefly cite the frames around the snap in evidence_notes
+
+Do not analyze personnel, formation, motion, defense, pressure, coverage, or play concept.
+"""
+
+
+def _temporal_presnap_prompt_v34(play_context: dict, evidence: dict) -> str:
+    context = _context(play_context)
+    frame_map = "\n".join(
+        (
+            f"FRAME {item['frame_index']:02d} = {item['timestamp_seconds']:.2f}s "
+            f"({item.get('relative_to_snap_seconds', 0):+.2f}s from snap)"
+        )
+        for item in evidence.get("frames", [])
+        if item.get("phase") == "pre_snap"
+    )
+    return f"""
+You are performing the PRE-SNAP pass for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+These frames were re-extracted relative to an estimated snap time.
+Use only the PRE-SNAP frames listed below.
+
+Timeline:
+{frame_map}
+
+IMPORTANT: the timestamps are football-relative now.
+A frame at -5.00s is much earlier than a frame at -0.20s.
+
+PERSONNEL:
+Return best visual counts for:
+- back_count
+- attached_te_count
+- wing_hback_count
+- flexed_te_count
+- split_wr_count
+These buckets should sum to 5 when all players are visible.
+
+FORMATION / RB TIMELINE:
+- earliest settled frame: use the earliest frame that clearly shows a settled offensive formation
+- final pre-snap frame: use the last clear frame before the snap
+- compare rb_initial_side to rb_final_side literally
+- if the RB changes sides and becomes stationary before snap, that is a shift
+- if a player is still moving immediately before snap, that is motion
+
+Also chart:
+- formation family
+- initial/final receiver structure
+- formation strength
+- defensive personnel
+- front family
+- initial box count
+- snap box count
+- safety shell
+- defensive adjustment trigger/type
+
+BOX RULE:
+Count LOS/edge defenders in the run front plus second-level defenders clearly committed to the box.
+Use the earliest settled frame for initial_box_count and the final clear pre-snap frame for snap_box_count.
+
+CFBD play-by-play is outcome context only.
+In evidence_notes cite exact relative times that support RB start/end, shift/motion, and box counts.
+"""
+
+
+def _temporal_postsnap_prompt_v34(play_context: dict, evidence: dict) -> str:
+    context = _context(play_context)
+    frame_map = "\n".join(
+        (
+            f"FRAME {item['frame_index']:02d} = {item['timestamp_seconds']:.2f}s "
+            f"({item.get('relative_to_snap_seconds', 0):+.2f}s from snap)"
+        )
+        for item in evidence.get("frames", [])
+        if item.get("phase") == "post_snap"
+    )
+    return f"""
+You are performing the POST-SNAP pass for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+These frames were re-extracted relative to the estimated snap time.
+Use only the POST-SNAP frames listed below.
+
+Timeline:
+{frame_map}
+
+PLAY:
+- classify Run, Pass, RPO, Scramble, Sack, Other, or Unknown
+- identify run concept/direction only when blocking and ball action support it
+- identify pass concept only when route structure is visible enough
+- answer RPO and play_action from actual post-snap action
+
+RUSHER ENUMERATION — highest priority:
+Create rusher_descriptions with EXACTLY ONE entry for EACH UNIQUE defender whose actual action
+attacks the LOS/backfield/QB/pass protection.
+
+Use generic identities such as:
+"left edge", "left DT", "right DT", "right edge", "Mike LB", "nickel", "safety".
+
+Track defenders across the dense +0.20s, +0.40s, +0.70s, +1.00s, +1.50s, +2.00s, +3.00s frames.
+Do not stop at four.
+Do not count the same defender twice.
+Put threatened-but-dropping defenders in bluff_or_drop_descriptions instead.
+
+PRESSURE / COVERAGE:
+- pressure_family_observed must reflect the actual rush
+- pressure_source summarizes unusual/nontraditional rushers
+- coverage is actual post-snap coverage, not the pre-snap shell
+
+CFBD play-by-play is outcome context only.
+In evidence_notes cite exact relative times for each rusher and for any coverage rotation.
 """
 
 
@@ -2168,6 +2320,225 @@ def analyze_clip_gemini_v33(
             "post_snap": post.confidence,
         },
         "_passes": {
+            "pre_snap": pre.model_dump(),
+            "post_snap": post.model_dump(),
+        },
+    }
+
+
+
+
+def _filter_phase_evidence_v34(evidence: dict, phase: str) -> dict:
+    selected = [item for item in evidence.get("frames", []) if item.get("phase") == phase]
+    return {
+        "clip_path": evidence.get("clip_path"),
+        "duration_seconds": evidence.get("duration_seconds"),
+        "frame_count": len(selected),
+        "frames": selected,
+        "estimated_snap_timestamp_seconds": evidence.get("estimated_snap_timestamp_seconds"),
+        "reading_order": "Read frames in ascending frame_index.",
+    }
+
+
+def analyze_clip_gemini_v34(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V3.4: coarse snap locator -> dense snap-centered extraction -> focused pre/post passes.
+
+    Three Gemini requests are used:
+    1) locate snap from coarse frames,
+    2) analyze dense pre-snap frames,
+    3) analyze dense post-snap frames.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    base_dir = Path("local_data") / "temporal_evidence_v34" / source.stem
+    coarse_dir = base_dir / "coarse"
+    centered_dir = base_dir / "snap_centered"
+
+    coarse = extract_temporal_frames_v31(
+        clip_path=source,
+        output_dir=coarse_dir,
+        width=1280,
+    )
+
+    client = genai.Client(api_key=api_key)
+
+    locator = _call_structured_images_v31(
+        client=client,
+        model=model,
+        evidence=coarse,
+        prompt=_snap_locator_prompt_v34(play_context, coarse),
+        schema=SnapLocatorV34,
+    )
+
+    centered = extract_snap_centered_frames_v34(
+        clip_path=source,
+        output_dir=centered_dir,
+        snap_timestamp_seconds=locator.snap_timestamp_seconds,
+        width=1280,
+    )
+    pre_evidence = _filter_phase_evidence_v34(centered, "pre_snap")
+    post_evidence = _filter_phase_evidence_v34(centered, "post_snap")
+
+    time.sleep(1)
+
+    pre = _call_structured_images_v31(
+        client=client,
+        model=model,
+        evidence=pre_evidence,
+        prompt=_temporal_presnap_prompt_v34(play_context, centered),
+        schema=TemporalPreSnapV33,
+    )
+
+    time.sleep(1)
+
+    post = _call_structured_images_v31(
+        client=client,
+        model=model,
+        evidence=post_evidence,
+        prompt=_temporal_postsnap_prompt_v34(play_context, centered),
+        schema=TemporalPostSnapV33,
+    )
+
+    personnel, te_count, eligible_total = _derive_personnel_v21(
+        pre.back_count,
+        pre.attached_te_count,
+        pre.wing_hback_count,
+        pre.flexed_te_count,
+        pre.split_wr_count,
+    )
+
+    initial_backfield = _backfield_from_shape_and_side(None, pre.rb_initial_side)
+    final_backfield = _backfield_from_shape_and_side(None, pre.rb_final_side)
+
+    motion_present = pre.any_player_moving_at_snap
+    shift_present = pre.any_alignment_change_set_before_snap
+    if pre.rb_changed_sides and pre.rb_set_before_snap:
+        shift_present = True
+    if pre.rb_changed_sides and not pre.rb_set_before_snap:
+        motion_present = True
+
+    rusher_count = _unique_description_count(post.rusher_descriptions)
+    blitz, pressure_family = _derive_pressure(
+        rusher_count,
+        post.pressure_family_observed,
+    )
+
+    shift_description = None
+    if shift_present:
+        if pre.rb_changed_sides:
+            shift_description = (
+                f"RB changed from {pre.rb_initial_side} to {pre.rb_final_side} "
+                f"and {'set' if pre.rb_set_before_snap else 'did not set'} before snap"
+            )
+        elif pre.primary_mover and pre.primary_mover.lower() != "unknown":
+            shift_description = f"{pre.primary_mover} changed alignment and became set before snap"
+
+    evidence_notes = " | ".join(
+        note
+        for note in (
+            f"Snap locator: {locator.evidence_notes}",
+            pre.evidence_notes,
+            post.evidence_notes,
+        )
+        if note
+    )
+
+    return {
+        "personnel": personnel,
+        "formation_family": pre.formation_family,
+        "initial_formation": pre.initial_receiver_structure,
+        "initial_backfield": initial_backfield,
+        "final_formation": pre.final_receiver_structure,
+        "final_backfield": final_backfield,
+        "formation_strength": pre.formation_strength,
+
+        "motion_present": motion_present,
+        "motion_player": pre.primary_mover if motion_present else None,
+        "motion_type": pre.movement_type if motion_present else None,
+        "motion_direction": pre.movement_direction if motion_present else None,
+        "motion_start_alignment": None,
+        "motion_end_alignment": None,
+        "shift_present": shift_present,
+        "shift_description": shift_description,
+
+        "film_play_type": post.film_play_type,
+        "run_concept": post.run_concept,
+        "run_direction": post.run_direction,
+        "pass_concept": post.pass_concept,
+        "rpo": post.rpo,
+        "play_action": post.play_action,
+
+        "defensive_personnel": pre.defensive_personnel,
+        "front": pre.front_family,
+        "initial_box_count": pre.initial_box_count,
+        "snap_box_count": pre.snap_box_count,
+        "shell": pre.shell,
+        "coverage": post.coverage,
+        "rushers": rusher_count,
+        "blitz": blitz,
+        "pressure_family": pressure_family,
+        "pressure_source": post.pressure_source,
+
+        "adjustment_trigger": pre.adjustment_trigger,
+        "adjustment_type": pre.adjustment_type,
+        "adjustment_player": None,
+        "adjustment_detail": None,
+
+        "overall_confidence": (
+            float(locator.confidence) + float(pre.confidence) + float(post.confidence)
+        ) / 3.0,
+        "uncertain_fields": [],
+        "analysis_notes": evidence_notes,
+
+        "_model": model,
+        "_provider": "google-gemini",
+        "_analyzer_version": "v3.4-snap-centered",
+        "_temporal_evidence": {
+            "coarse_frame_count": coarse["frame_count"],
+            "coarse_frames": coarse["frames"],
+            "locator_snap_frame_index": locator.snap_frame_index,
+            "locator_snap_timestamp_seconds": locator.snap_timestamp_seconds,
+            "centered_frame_count": centered["frame_count"],
+            "centered_frames": centered["frames"],
+            "estimated_snap_timestamp_seconds": centered["estimated_snap_timestamp_seconds"],
+            "pre_frame_count": pre_evidence["frame_count"],
+            "post_frame_count": post_evidence["frame_count"],
+        },
+        "_derived": {
+            "back_count": pre.back_count,
+            "attached_te_count": pre.attached_te_count,
+            "wing_hback_count": pre.wing_hback_count,
+            "flexed_te_count": pre.flexed_te_count,
+            "te_count": te_count,
+            "split_wr_count": pre.split_wr_count,
+            "eligible_total": eligible_total,
+            "rb_initial_side": pre.rb_initial_side,
+            "rb_final_side": pre.rb_final_side,
+            "rb_changed_sides": pre.rb_changed_sides,
+            "rb_set_before_snap": pre.rb_set_before_snap,
+            "initial_box_count": pre.initial_box_count,
+            "snap_box_count": pre.snap_box_count,
+            "rusher_descriptions": post.rusher_descriptions,
+            "bluff_or_drop_descriptions": post.bluff_or_drop_descriptions,
+            "rusher_count_rule": "unique non-empty rusher descriptions",
+            "blitz_rule": "5+ unique actual rushers -> blitz",
+        },
+        "_pass_confidence": {
+            "snap_locator": locator.confidence,
+            "pre_snap": pre.confidence,
+            "post_snap": post.confidence,
+        },
+        "_passes": {
+            "snap_locator": locator.model_dump(),
             "pre_snap": pre.model_dump(),
             "post_snap": post.model_dump(),
         },
