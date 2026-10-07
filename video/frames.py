@@ -225,3 +225,93 @@ def create_temporal_evidence_sheets(
         "manifest": manifest,
         "reading_order": "Sheets in numeric order; within each sheet read left-to-right, top-to-bottom.",
     }
+
+
+def extract_temporal_frames_v31(
+    clip_path: str | Path,
+    output_dir: str | Path,
+    width: int = 1280,
+) -> dict:
+    """
+    Extract 12 high-resolution chronological frames for V3.1.
+
+    Sampling is intentionally uneven:
+    - early frames establish the initial pre-snap alignment,
+    - middle frames are denser around the likely snap window,
+    - late frames preserve post-snap evidence for rushers and coverage.
+
+    Returns a manifest with each frame's path, index, and clip-relative timestamp.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    destination = Path(output_dir)
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    duration = probe_duration(source)
+
+    # These fractions assume Film Lab clips already contain a useful pre-snap lead-in
+    # and post-snap tail. The middle of the clip is sampled more densely because that
+    # is where the snap is usually located.
+    fractions = [
+        0.08,
+        0.16,
+        0.24,
+        0.34,
+        0.42,
+        0.50,
+        0.56,
+        0.62,
+        0.68,
+        0.76,
+        0.86,
+        0.94,
+    ]
+
+    frames: list[dict] = []
+    for idx, fraction in enumerate(fractions, start=1):
+        timestamp = min(max(duration * fraction, 0.0), max(duration - 0.02, 0.0))
+        frame_path = destination / f"frame_{idx:02d}.jpg"
+
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{timestamp:.3f}",
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={int(width)}:-2",
+                "-q:v",
+                "2",
+                str(frame_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Unknown FFmpeg error").strip()
+            raise RuntimeError(detail)
+
+        frames.append(
+            {
+                "frame_index": idx,
+                "timestamp_seconds": round(timestamp, 3),
+                "path": str(frame_path),
+            }
+        )
+
+    return {
+        "clip_path": str(source),
+        "duration_seconds": duration,
+        "frame_count": len(frames),
+        "frames": frames,
+        "reading_order": "Read frame_01 through frame_12 in numeric order.",
+    }
