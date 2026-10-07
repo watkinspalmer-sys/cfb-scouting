@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from analytics.benchmark import category_summary, compare_prediction, score_prediction
+from analytics.benchmark import category_summary, compare_prediction, field_summary, score_prediction
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
@@ -511,6 +511,199 @@ def _stored_v1_accuracy(reviewed: pd.DataFrame, model: str, video_fps: float, us
     return {"plays": plays, "matches": matches, "total": total, "accuracy": matches / total}
 
 
+
+
+def _stored_version_detail(
+    reviewed: pd.DataFrame,
+    analyzer_version: str,
+    model: str,
+    video_fps: float,
+    use_play_text: bool,
+) -> pd.DataFrame:
+    """Rebuild per-field benchmark detail from predictions already saved locally."""
+    stored = load_ai_predictions()
+    if stored.empty or "prediction_json" not in stored.columns:
+        return pd.DataFrame()
+
+    if "analyzer_version" not in stored.columns:
+        stored["analyzer_version"] = "v1-single-pass"
+    else:
+        stored["analyzer_version"] = stored["analyzer_version"].fillna("v1-single-pass")
+
+    candidates = stored[
+        stored["model"].astype(str).eq(str(model))
+        & stored["analyzer_version"].astype(str).eq(str(analyzer_version))
+    ].copy()
+
+    if "video_fps" in candidates.columns:
+        candidates = candidates[
+            pd.to_numeric(candidates["video_fps"], errors="coerce").eq(float(video_fps))
+        ]
+    if "use_play_text" in candidates.columns:
+        candidates = candidates[
+            candidates["use_play_text"].astype(str).str.lower().eq(str(use_play_text).lower())
+        ]
+
+    if candidates.empty:
+        return pd.DataFrame()
+
+    human_by_key = {}
+    for _, row in reviewed.iterrows():
+        game_id = _id_text(row.get("game_id"))
+        play_id = _id_text(row.get("play_id"))
+        human_by_key[(game_id, play_id)] = row
+
+    comparisons = []
+    for _, stored_row in candidates.iterrows():
+        key = (_id_text(stored_row.get("game_id")), _id_text(stored_row.get("play_id")))
+        human = human_by_key.get(key)
+        if human is None:
+            continue
+        try:
+            prediction = json.loads(stored_row["prediction_json"])
+        except Exception:
+            continue
+
+        comparison = compare_prediction(human.to_dict(), prediction)
+        comparison["game_id"] = key[0]
+        comparison["play_id"] = key[1]
+        comparison["chart_side"] = str(_clean(stored_row.get("chart_side"), ""))
+        comparison["analyzer_version"] = analyzer_version
+        comparisons.append(comparison)
+
+    return pd.concat(comparisons, ignore_index=True) if comparisons else pd.DataFrame()
+
+
+def _shared_play_field_comparison(
+    reviewed: pd.DataFrame,
+    current_version: str,
+    model: str,
+    video_fps: float,
+    use_play_text: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Compare V1 and the selected analyzer only on plays that exist in both stored result sets.
+    Returns current_detail, v1_detail, merged field summary.
+    """
+    current = _stored_version_detail(
+        reviewed, current_version, model, video_fps, use_play_text
+    )
+    v1 = _stored_version_detail(
+        reviewed, "v1-single-pass", model, video_fps, use_play_text
+    )
+    if current.empty or v1.empty:
+        return current, v1, pd.DataFrame()
+
+    current_keys = set(
+        zip(current["game_id"].astype(str), current["play_id"].astype(str))
+    )
+    v1_keys = set(zip(v1["game_id"].astype(str), v1["play_id"].astype(str)))
+    shared = current_keys & v1_keys
+    if not shared:
+        return current.iloc[0:0].copy(), v1.iloc[0:0].copy(), pd.DataFrame()
+
+    current_shared = current[
+        current.apply(
+            lambda row: (str(row["game_id"]), str(row["play_id"])) in shared,
+            axis=1,
+        )
+    ].copy()
+    v1_shared = v1[
+        v1.apply(
+            lambda row: (str(row["game_id"]), str(row["play_id"])) in shared,
+            axis=1,
+        )
+    ].copy()
+
+    current_fields = field_summary(current_shared).rename(
+        columns={
+            "Matches": "Current matches",
+            "Scored plays": "Current scored plays",
+            "Accuracy": "Current accuracy",
+        }
+    )
+    v1_fields = field_summary(v1_shared).rename(
+        columns={
+            "Matches": "V1 matches",
+            "Scored plays": "V1 scored plays",
+            "Accuracy": "V1 accuracy",
+        }
+    )
+
+    merged = v1_fields.merge(
+        current_fields,
+        on=["Field", "Category"],
+        how="outer",
+    )
+    if not merged.empty:
+        merged["Change"] = merged["Current accuracy"] - merged["V1 accuracy"]
+        merged = merged.sort_values(
+            ["Category", "Change", "Field"],
+            ascending=[True, False, True],
+        ).reset_index(drop=True)
+
+    return current_shared, v1_shared, merged
+
+
+def _render_stored_field_analysis(
+    reviewed: pd.DataFrame,
+    analyzer_version: str,
+    model: str,
+    video_fps: float,
+    use_play_text: bool,
+):
+    if analyzer_version == "v1-single-pass":
+        return
+
+    current_detail, v1_detail, comparison = _shared_play_field_comparison(
+        reviewed,
+        analyzer_version,
+        model,
+        video_fps,
+        use_play_text,
+    )
+    if comparison.empty:
+        return
+
+    current_keys = set(
+        zip(current_detail["game_id"].astype(str), current_detail["play_id"].astype(str))
+    )
+    st.subheader("Stored field-level V1 comparison")
+    st.caption(
+        f"Built from locally saved predictions only — no new Gemini calls. "
+        f"Comparison is restricted to {len(current_keys)} play(s) present in both V1 and "
+        f"{analyzer_version}."
+    )
+
+    display = comparison.copy()
+    for column in ("V1 accuracy", "Current accuracy", "Change"):
+        display[column] = display[column].map(
+            lambda value: f"{value:+.0%}" if column == "Change" and pd.notna(value)
+            else f"{value:.0%}" if pd.notna(value)
+            else ""
+        )
+    st.dataframe(display, hide_index=True, use_container_width=True)
+
+    export = comparison.copy()
+    st.download_button(
+        "Download V1 vs current field comparison CSV",
+        data=export.to_csv(index=False).encode("utf-8"),
+        file_name=f"field_comparison_v1_vs_{analyzer_version}.csv",
+        mime="text/csv",
+        key=f"stored_field_compare_{analyzer_version}",
+    )
+
+    current_fields = field_summary(current_detail)
+    if not current_fields.empty:
+        st.download_button(
+            f"Download {analyzer_version} field accuracy CSV",
+            data=current_fields.to_csv(index=False).encode("utf-8"),
+            file_name=f"field_accuracy_{analyzer_version}.csv",
+            mime="text/csv",
+            key=f"stored_field_current_{analyzer_version}",
+        )
+
+
 def _render_batch(
     reviewed: pd.DataFrame,
     side_lookup: dict[str, str],
@@ -593,6 +786,14 @@ def _render_batch(
     if not eligible:
         st.info("No benchmark plays are ready for batch analysis.")
         return
+
+    _render_stored_field_analysis(
+        reviewed,
+        analyzer_version,
+        model.strip(),
+        float(video_fps),
+        bool(use_play_text),
+    )
 
     run_batch = st.button(
         f"Run all {len(eligible)} plays with {analyzer_label}",
@@ -730,9 +931,36 @@ def _render_batch(
         category_display["Accuracy"] = category_display["Accuracy"].map(lambda v: f"{v:.0%}")
         st.dataframe(category_display, hide_index=True, use_container_width=True)
 
+    fields = field_summary(detail)
+    if not fields.empty:
+        st.subheader("Accuracy by benchmark field")
+        field_display = fields.copy()
+        field_display["Accuracy"] = field_display["Accuracy"].map(
+            lambda value: f"{value:.0%}" if pd.notna(value) else ""
+        )
+        st.dataframe(field_display, hide_index=True, use_container_width=True)
+
     if not errors.empty:
         with st.expander(f"Batch errors ({len(errors)})"):
             st.dataframe(errors, hide_index=True, use_container_width=True)
+
+    if not detail.empty:
+        st.download_button(
+            "Download field-level benchmark detail CSV",
+            data=detail.to_csv(index=False).encode("utf-8"),
+            file_name=f"ai_benchmark_detail_{analyzer_version}.csv",
+            mime="text/csv",
+            key=f"download_detail_{analyzer_version}",
+        )
+
+    if not fields.empty:
+        st.download_button(
+            "Download field accuracy CSV",
+            data=fields.to_csv(index=False).encode("utf-8"),
+            file_name=f"ai_benchmark_fields_{analyzer_version}.csv",
+            mime="text/csv",
+            key=f"download_fields_{analyzer_version}",
+        )
 
     st.download_button(
         "Download batch summary CSV",
