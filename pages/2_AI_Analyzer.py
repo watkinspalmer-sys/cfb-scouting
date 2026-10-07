@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, score_pred
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3
 
 
 ANALYZERS = {
-    "V2.1 mechanical 3-pass (recommended)": ("v2.1-mechanical", analyze_clip_gemini_v21),
+    "V3 temporal evidence 1-pass (recommended)": ("v3-temporal-evidence", analyze_clip_gemini_v3),
+    "V2.1 mechanical 3-pass": ("v2.1-mechanical", analyze_clip_gemini_v21),
     "V2 specialized 3-pass": ("v2-specialized", analyze_clip_gemini_v2),
     "V1 single-pass baseline": ("v1-single-pass", analyze_clip_gemini),
 }
@@ -223,7 +224,12 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            passes = "three specialized passes" if analyzer_version in {"v2-specialized", "v2.1-mechanical"} else "one pass"
+            if analyzer_version == "v3-temporal-evidence":
+                passes = "one temporal-evidence pass"
+            elif analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
+                passes = "three specialized passes"
+            else:
+                passes = "one native-video pass"
             with st.spinner(f"Analyzing with {passes} using {model} at {video_fps:.1f} FPS..."):
                 prediction = _run_analyzer(
                     analyzer_fn, clip_path, human, role.lower(), use_play_text,
@@ -256,7 +262,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -265,7 +271,24 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v2.1-mechanical":
+        if analyzer_version == "v3-temporal-evidence":
+            st.caption(
+                "V3 extracts 24 frames locally, builds three timestamped timeline sheets, "
+                "and sends those images to Gemini in one request. Python still derives "
+                "personnel, backfield labels, box totals, and blitz."
+            )
+            evidence = prediction.get("_temporal_evidence") or {}
+            e1, e2, e3 = st.columns(3)
+            e1.metric("Evidence frames", evidence.get("frame_count", "—"))
+            e2.metric("Snap frame", evidence.get("snap_frame_index", "—"))
+            snap_time = evidence.get("snap_timestamp_seconds")
+            e3.metric("Snap time", f"{snap_time:.2f}s" if isinstance(snap_time, (int, float)) else "—")
+            sheet_paths = evidence.get("sheet_paths") or []
+            with st.expander("View V3 temporal evidence sheets"):
+                for sheet_path in sheet_paths:
+                    if Path(sheet_path).exists():
+                        st.image(str(sheet_path), caption=Path(sheet_path).name, use_container_width=True)
+        elif analyzer_version == "v2.1-mechanical":
             st.caption(
                 "V2.1 derives personnel from five eligible-player buckets, derives backfield "
                 "alignment from explicit RB-side tracking, adds two defensive box layers, and "
@@ -381,7 +404,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version == "v3-temporal-evidence":
+        st.info(
+            "V3 performs FFmpeg frame extraction locally, builds 3 timestamped evidence sheets, "
+            "then makes only 1 Gemini image-analysis request per snap. The FPS slider is ignored "
+            "for V3 because it uses a fixed 24-frame timeline."
+        )
+    elif analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
         version_name = "V2.1" if analyzer_version == "v2.1-mechanical" else "V2"
         st.info(
             f"{version_name} uploads each clip once, then makes 3 Gemini analysis calls against "
@@ -472,7 +501,12 @@ def _render_batch(
 
             progress.progress(position / len(eligible), text=f"Completed {position}/{len(eligible)}")
             if position < len(eligible):
-                time.sleep(8 if analyzer_version in {"v2-specialized", "v2.1-mechanical"} else 6)
+                if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
+                    time.sleep(8)
+                elif analyzer_version == "v3-temporal-evidence":
+                    time.sleep(6)
+                else:
+                    time.sleep(6)
 
         detail = pd.concat(comparisons, ignore_index=True) if comparisons else pd.DataFrame()
         st.session_state[batch_key] = {
@@ -504,7 +538,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -544,8 +578,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V2.1 separates structure, movement, and post-snap recognition, then derives "
-        "personnel, backfield changes, box totals, and blitz with deterministic rules."
+        "V3 turns each clip into timestamped temporal evidence sheets locally, sends one "
+        "Gemini image-analysis request, and derives football labels with deterministic rules."
     )
 
     chart = load_film_chart()
@@ -568,7 +602,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V2.1 for the mechanical benchmark. V2 and V1 remain available as baselines.",
+        help="Use V3 for the temporal-evidence benchmark. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
@@ -583,7 +617,7 @@ def main():
         max_value=5.0,
         value=5.0,
         step=0.5,
-        help="5 FPS is the current benchmark baseline.",
+        help="Used by V1/V2 native-video analysis. V3 ignores this and uses 24 local timeline frames.",
     )
     use_play_text = st.checkbox(
         "Give the model CFBD play-by-play context",
