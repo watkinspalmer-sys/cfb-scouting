@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import base64
 import json
+import time
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Optional, Protocol
 
-from openai import OpenAI
+from google import genai
+from pydantic import BaseModel, Field
 
 from models.schemas import FilmObservation
-from video.frames import extract_analysis_frames
 
 
 class VideoAnalyzer(Protocol):
@@ -18,72 +18,54 @@ class VideoAnalyzer(Protocol):
         ...
 
 
-def _nullable_enum(values: list[str]) -> dict:
-    return {"type": ["string", "null"], "enum": values + [None]}
+class FootballSnapChart(BaseModel):
+    personnel: Optional[Literal["10", "11", "12", "13", "20", "21", "22", "Other", "Unknown"]] = None
+    formation_family: Optional[Literal["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]] = None
+    initial_formation: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    initial_backfield: Optional[Literal["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+    final_formation: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    final_backfield: Optional[Literal["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+    formation_strength: Optional[Literal["Left", "Right", "Balanced", "Boundary", "Field", "Unknown"]] = None
+
+    motion_present: Optional[bool] = None
+    motion_player: Optional[str] = None
+    motion_type: Optional[Literal["Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other", "Unknown"]] = None
+    motion_direction: Optional[str] = None
+    motion_start_alignment: Optional[str] = None
+    motion_end_alignment: Optional[str] = None
+
+    shift_present: Optional[bool] = None
+    shift_description: Optional[str] = None
+
+    film_play_type: Optional[Literal["Run", "Pass", "RPO", "Scramble", "Sack", "Other", "Unknown"]] = None
+    run_concept: Optional[str] = None
+    run_direction: Optional[Literal["Left", "Right", "Middle", "Boundary", "Field", "Unknown"]] = None
+    pass_concept: Optional[str] = None
+    rpo: Optional[bool] = None
+    play_action: Optional[bool] = None
+
+    defensive_personnel: Optional[str] = None
+    front: Optional[str] = None
+    initial_box_count: Optional[int] = Field(default=None, ge=0, le=11)
+    snap_box_count: Optional[int] = Field(default=None, ge=0, le=11)
+    shell: Optional[Literal["1-High", "2-High", "0-High", "Unknown"]] = None
+    coverage: Optional[str] = None
+    rushers: Optional[int] = Field(default=None, ge=0, le=11)
+    blitz: Optional[bool] = None
+    pressure_family: Optional[Literal["Standard rush", "Blitz", "Sim pressure", "Creeper", "Zero pressure", "Unknown"]] = None
+    pressure_source: Optional[str] = None
+
+    adjustment_trigger: Optional[Literal["None", "Motion", "Shift", "Defensive stem", "Cadence/check", "Other", "Unknown"]] = None
+    adjustment_type: Optional[Literal["None", "Bump", "Travel", "Safety rotation", "Front shift", "Box insert", "Box remove", "Other", "Unknown"]] = None
+    adjustment_player: Optional[str] = None
+    adjustment_detail: Optional[str] = None
+
+    overall_confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    analysis_notes: str = ""
 
 
-def football_chart_schema() -> dict:
-    """Structured-output schema for one football snap."""
-    properties = {
-        "personnel": _nullable_enum(["10", "11", "12", "13", "20", "21", "22", "Other", "Unknown"]),
-        "formation_family": _nullable_enum(["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]),
-        "initial_formation": _nullable_enum(["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]),
-        "initial_backfield": _nullable_enum(["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]),
-        "final_formation": _nullable_enum(["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]),
-        "final_backfield": _nullable_enum(["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]),
-        "formation_strength": _nullable_enum(["Left", "Right", "Balanced", "Boundary", "Field", "Unknown"]),
-        "motion_present": {"type": ["boolean", "null"]},
-        "motion_player": {"type": ["string", "null"]},
-        "motion_type": _nullable_enum(["Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other", "Unknown"]),
-        "motion_direction": {"type": ["string", "null"]},
-        "motion_start_alignment": {"type": ["string", "null"]},
-        "motion_end_alignment": {"type": ["string", "null"]},
-        "shift_present": {"type": ["boolean", "null"]},
-        "shift_description": {"type": ["string", "null"]},
-        "film_play_type": _nullable_enum(["Run", "Pass", "RPO", "Scramble", "Sack", "Other", "Unknown"]),
-        "run_concept": {"type": ["string", "null"]},
-        "run_direction": _nullable_enum(["Left", "Right", "Middle", "Boundary", "Field", "Unknown"]),
-        "pass_concept": {"type": ["string", "null"]},
-        "rpo": {"type": ["boolean", "null"]},
-        "play_action": {"type": ["boolean", "null"]},
-        "defensive_personnel": {"type": ["string", "null"]},
-        "front": {"type": ["string", "null"]},
-        "initial_box_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 11},
-        "snap_box_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 11},
-        "shell": _nullable_enum(["1-High", "2-High", "0-High", "Unknown"]),
-        "coverage": {"type": ["string", "null"]},
-        "rushers": {"type": ["integer", "null"], "minimum": 0, "maximum": 11},
-        "blitz": {"type": ["boolean", "null"]},
-        "pressure_family": _nullable_enum(["Standard rush", "Blitz", "Sim pressure", "Creeper", "Zero pressure", "Unknown"]),
-        "pressure_source": {"type": ["string", "null"]},
-        "adjustment_trigger": _nullable_enum(["None", "Motion", "Shift", "Defensive stem", "Cadence/check", "Other", "Unknown"]),
-        "adjustment_type": _nullable_enum(["None", "Bump", "Travel", "Safety rotation", "Front shift", "Box insert", "Box remove", "Other", "Unknown"]),
-        "adjustment_player": {"type": ["string", "null"]},
-        "adjustment_detail": {"type": ["string", "null"]},
-        "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "uncertain_fields": {"type": "array", "items": {"type": "string"}},
-        "analysis_notes": {"type": "string"},
-    }
-    return {
-        "type": "json_schema",
-        "name": "football_snap_chart",
-        "description": "Structured scouting chart for one American football snap.",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": properties,
-            "required": list(properties.keys()),
-            "additionalProperties": False,
-        },
-    }
-
-
-def _image_data_url(path: Path) -> str:
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
-
-
-def _prompt(play_context: dict, frame_times: list[float]) -> str:
+def _prompt(play_context: dict) -> str:
     context = {
         "chart_team": play_context.get("team"),
         "chart_team_role": play_context.get("chart_side"),
@@ -94,103 +76,111 @@ def _prompt(play_context: dict, frame_times: list[float]) -> str:
         "play_text": play_context.get("play_text"),
     }
 
-    times = ", ".join(f"{seconds:.1f}s" for seconds in frame_times)
     return f"""
-You are charting ONE college football snap for a scouting database.
-
-The images are sequential frames from the same short broadcast clip, ordered from
-earliest to latest. Approximate clip-relative frame times are: {times}.
+You are an expert college football film analyst charting ONE snap for a scouting database.
 
 Game context:
 {json.dumps(context, indent=2)}
 
-Chart BOTH the offense and defense from the film. The team named in chart_team is
-identified only so you know which team is offense/defense on this snap.
+Watch the supplied video clip from beginning to end and chart BOTH the offense and defense.
 
-Football charting rules:
-- Personnel means WHO is on the field, not where they align. A RB motioning to
-  receiver does not change 20 personnel into 10 personnel.
+Charting rules:
+- Personnel means WHO is on the field, not where players align. If a RB motions
+  from the backfield to receiver, 20 personnel remains 20 personnel.
 - initial_formation / initial_backfield describe the earliest settled offensive
-  alignment visible before motion/shift.
-- final_formation / final_backfield describe alignment at the snap.
-- Motion means a player is moving immediately before/through the snap. A shift is
-  a change of alignment followed by the offense becoming set.
-- If the camera angle cannot support a label, use Unknown or null. Do not invent.
-- Count the box from defenders structurally committed to the run box.
-- A Blitz is normally 5+ rushers. Sim pressure/Creeper can have four rushers with
-  a non-traditional rusher and a dropper.
-- Coverage should be conservative. If post-snap evidence is insufficient, use
-  "Unknown".
-- Concepts should use common football terminology (inside zone, counter, power,
-  stretch, pitch, mesh, hitches, four verts, screen, etc.) only when supported.
-- Use the play_text as structured outcome context, but do NOT let it override
-  what the film shows for personnel, formation, motion, front, shell, pressure,
-  or concept.
-- uncertain_fields should list fields you would want a human to review.
-- overall_confidence is your confidence in the chart as a whole from 0 to 1.
+  alignment visible before motion or shift.
+- final_formation / final_backfield describe the alignment at the snap.
+- Motion means a player is still moving immediately before/through the snap.
+  A shift is a change of alignment followed by the offense becoming set.
+- Distinguish field and boundary when the broadcast angle supports it.
+- Count defenders structurally committed to the run box.
+- Blitz normally means 5+ rushers. Sim pressure or creeper can rush four while
+  bringing a non-traditional rusher and dropping a traditional rush player.
+- Coverage must be conservative. Use Unknown if the broadcast angle or clip does
+  not show enough of the secondary after the snap.
+- Use common football terminology for concepts only when supported by the film:
+  inside zone, outside zone/stretch, power, counter, duo, pitch, draw, screen,
+  mesh, hitches, four verts, flood, smash, etc.
+- The play-by-play is outcome context only. It must NOT override what the film
+  shows for personnel, formation, motion, front, box, shell, pressure, or concept.
+- Use Unknown/null instead of guessing.
+- uncertain_fields must list fields that should receive human review.
+- overall_confidence is confidence in the complete chart from 0 to 1.
+
+Pay special attention to the several seconds immediately before the snap so that
+motions, shifts, defensive bumps, safety rotations, and box changes are not missed.
 """
 
 
-def analyze_clip_openai(
+def analyze_clip_gemini(
     clip_path: str | Path,
     play_context: dict,
     api_key: str,
-    model: str = "gpt-5",
-    frame_count: int = 8,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 3.0,
 ) -> dict:
     """
-    Analyze one snap by sampling frames and sending the ordered sequence to OpenAI.
+    Upload one short snap clip to Gemini and return a structured football chart.
 
-    Full source broadcasts remain local; only sampled JPEG frames from the short
-    extracted snap are sent to the model.
+    The clip is temporarily uploaded to Google's Files API, analyzed using static
+    video processing at the requested FPS, then deleted from the Files API.
     """
     source = Path(clip_path)
-    frame_dir = Path("tmp_ai_frames") / source.stem
-    frames = extract_analysis_frames(source, frame_dir, frame_count=frame_count)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
 
-    content: list[dict] = [
-        {
-            "type": "input_text",
-            "text": _prompt(play_context, [timestamp for _, timestamp in frames]),
-        }
-    ]
-    for index, (frame_path, timestamp) in enumerate(frames, start=1):
-        content.append(
-            {
-                "type": "input_text",
-                "text": f"Frame {index} at approximately {timestamp:.1f} seconds:",
-            }
-        )
-        content.append(
-            {
-                "type": "input_image",
-                "image_url": _image_data_url(frame_path),
-                "detail": "high",
-            }
-        )
-
-    client = OpenAI(api_key=api_key)
-    response = client.responses.create(
-        model=model,
-        input=[{"role": "user", "content": content}],
-        text={"format": football_chart_schema()},
-        store=False,
-    )
-
-    if not response.output_text:
-        raise RuntimeError("The model returned no structured chart.")
+    client = genai.Client(api_key=api_key)
+    uploaded = None
 
     try:
-        result = json.loads(response.output_text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"The model response was not valid JSON: {response.output_text[:500]}"
-        ) from exc
+        uploaded = client.files.upload(file=str(source))
 
-    result["_model"] = model
-    result["_frame_count"] = len(frames)
-    result["_frame_times"] = [timestamp for _, timestamp in frames]
-    return result
+        while not uploaded.state or uploaded.state.name == "PROCESSING":
+            time.sleep(2)
+            uploaded = client.files.get(name=uploaded.name)
+
+        if uploaded.state and uploaded.state.name == "FAILED":
+            raise RuntimeError("Gemini failed to process the uploaded video.")
+
+        interaction = client.interactions.create(
+            model=model,
+            input=[
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "processing": {
+                        "type": "static",
+                        "fps": float(fps),
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": _prompt(play_context),
+                },
+            ],
+            response_format={
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": FootballSnapChart.model_json_schema(),
+            },
+        )
+
+        if not interaction.output_text:
+            raise RuntimeError("Gemini returned no structured chart.")
+
+        result = json.loads(interaction.output_text)
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        return result
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_stub(clip_path: str, play_context: dict) -> FilmObservation:
