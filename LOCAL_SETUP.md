@@ -66,3 +66,46 @@ The sidebar will include the Film Lab page.
 - Extracted clips go into `clips/`.
 - Reviewed charting data goes into `local_data/film_chart.csv`.
 - These local artifacts are not committed to GitHub.
+
+
+## 6. Configure AI Analyzer
+
+AI Analyzer v1 uses the OpenAI Responses API with sampled JPEG frames from each
+short snap clip. The full game broadcast stays on your PC.
+
+Add this to the same local file:
+
+`.streamlit\secrets.toml`
+
+```toml
+OPENAI_API_KEY = "your-openai-api-key-here"
+OPENAI_MODEL = "gpt-6-luna"
+```
+
+Do not commit or share the API key.
+
+The OpenAI API is billed separately from a ChatGPT subscription. Configure API
+billing/credits in your OpenAI API account before running AI analysis.
+
+After changing requirements, install them with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then start the app:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Open **AI Analyzer** in the Streamlit sidebar. Select one of the reviewed
+benchmark snaps, confirm whether the chart team is on offense or defense, and
+click **Analyze snap with AI**.
+
+AI predictions are stored locally in:
+
+`local_data\ai_predictions.csv`
+
+Temporary sampled frames are stored in `tmp_ai_frames\` and are ignored by
+Git.
