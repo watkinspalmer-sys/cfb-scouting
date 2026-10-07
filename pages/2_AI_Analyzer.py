@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, score_pred
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34
 
 
 ANALYZERS = {
-    "V3.3 two-pass temporal (recommended)": ("v3.3-two-pass-temporal", analyze_clip_gemini_v33),
+    "V3.4 snap-centered temporal (recommended)": ("v3.4-snap-centered", analyze_clip_gemini_v34),
+    "V3.3 two-pass temporal": ("v3.3-two-pass-temporal", analyze_clip_gemini_v33),
     "V3.2 temporal diagnostic 1-pass": ("v3.2-temporal-diagnostic", analyze_clip_gemini_v32_diagnostic),
     "V3.1 temporal frames 1-pass": ("v3.1-temporal-frames", analyze_clip_gemini_v31),
     "V3 temporal evidence 1-pass": ("v3-temporal-evidence", analyze_clip_gemini_v3),
@@ -227,7 +228,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v3.3-two-pass-temporal":
+            if analyzer_version == "v3.4-snap-centered":
+                passes = "three snap-centered temporal passes"
+            elif analyzer_version == "v3.3-two-pass-temporal":
                 passes = "two focused temporal passes"
             elif analyzer_version == "v3.2-temporal-diagnostic":
                 passes = "one narrow temporal diagnostic pass"
@@ -271,7 +274,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -280,7 +283,47 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v3.3-two-pass-temporal":
+        if analyzer_version == "v3.4-snap-centered":
+            st.caption(
+                "V3.4 first locates the snap from coarse frames, then re-extracts a dense timeline "
+                "from -5.0s to +4.0s around that estimated snap. Pre-snap and post-snap analysis "
+                "then run only on those football-relative frames."
+            )
+            evidence = prediction.get("_temporal_evidence") or {}
+            derived_v34 = prediction.get("_derived") or {}
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Coarse snap frame", evidence.get("locator_snap_frame_index", "—"))
+            snap_time = evidence.get("locator_snap_timestamp_seconds")
+            e2.metric("Estimated snap", f"{snap_time:.2f}s" if isinstance(snap_time, (int, float)) else "—")
+            e3.metric("RB start", derived_v34.get("rb_initial_side", "—"))
+            e4.metric("RB final", derived_v34.get("rb_final_side", "—"))
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Initial box", derived_v34.get("initial_box_count", "—"))
+            b2.metric("Snap box", derived_v34.get("snap_box_count", "—"))
+            rusher_desc = derived_v34.get("rusher_descriptions") or []
+            b3.metric("Unique rushers", len(rusher_desc))
+            b4.metric("Derived blitz", str(prediction.get("blitz", "—")))
+            st.write("**Enumerated rushers:**", rusher_desc if rusher_desc else "—")
+            bluff_desc = derived_v34.get("bluff_or_drop_descriptions") or []
+            if bluff_desc:
+                st.write("**Bluff/drop defenders:**", bluff_desc)
+            centered_frames = evidence.get("centered_frames") or []
+            with st.expander("View V3.4 snap-centered frames"):
+                for item in centered_frames:
+                    path = item.get("path")
+                    if path and Path(path).exists():
+                        rel = item.get("relative_to_snap_seconds")
+                        rel_text = f"{float(rel):+.2f}s" if isinstance(rel, (int, float)) else ""
+                        st.image(
+                            str(path),
+                            caption=(
+                                f"Frame {int(item.get('frame_index', 0)):02d} — "
+                                f"{float(item.get('timestamp_seconds', 0)):.2f}s "
+                                f"({rel_text} from snap)"
+                            ),
+                            use_container_width=True,
+                        )
+        elif analyzer_version == "v3.3-two-pass-temporal":
             st.caption(
                 "V3.3 reuses one 12-frame timeline for two narrow calls: a pre-snap structure/"
                 "movement pass and a post-snap play/pressure/coverage pass. Rusher count is derived "
@@ -502,7 +545,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v3.3-two-pass-temporal":
+    if analyzer_version == "v3.4-snap-centered":
+        st.info(
+            "V3.4 uses 3 Gemini requests per snap: a tiny coarse snap locator, then focused "
+            "pre-snap and post-snap passes over newly extracted snap-centered frames. The expensive "
+            "football analysis is now relative to the snap instead of percentages of clip length."
+        )
+    elif analyzer_version == "v3.3-two-pass-temporal":
         st.info(
             "V3.3 makes 2 Gemini requests per snap over one locally extracted 12-frame timeline: "
             "pre-snap structure/movement, then post-snap play/pressure/coverage. This is still fewer "
@@ -619,6 +668,8 @@ def _render_batch(
             if position < len(eligible):
                 if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
                     time.sleep(8)
+                elif analyzer_version == "v3.4-snap-centered":
+                    time.sleep(8)
                 elif analyzer_version == "v3.3-two-pass-temporal":
                     time.sleep(7)
                 elif analyzer_version in {"v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence"}:
@@ -656,7 +707,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -696,8 +747,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V3.3 uses two focused passes over the same 12 high-resolution chronological frames: "
-        "pre-snap structure/movement and post-snap play/pressure/coverage."
+        "V3.4 first locates the snap from coarse frames, then re-extracts dense football-relative "
+        "frames around that snap for focused pre-snap and post-snap analysis."
     )
 
     chart = load_film_chart()
@@ -720,7 +771,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V3.3 for the current two-pass temporal benchmark. Older analyzers remain available as baselines.",
+        help="Use V3.4 for the current snap-centered temporal benchmark. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
