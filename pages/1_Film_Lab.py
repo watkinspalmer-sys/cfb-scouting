@@ -417,9 +417,17 @@ def main():
         ["", "1-High", "2-High", "0-High", "Unknown"],
         saved.get("shell"),
     )
+    trigger_options, trigger_index = _options_with_saved(
+        ["", "None", "Motion", "Shift", "Defensive stem", "Cadence/check", "Other", "Unknown"],
+        saved.get("adjustment_trigger"),
+    )
     response_options, response_index = _options_with_saved(
-        ["", "None", "Bump", "Travel", "Safety rotation", "Front adjustment", "Box adjustment", "Other", "Unknown"],
-        saved.get("motion_response_type"),
+        ["", "None", "Bump", "Travel", "Safety rotation", "Front shift", "Box insert", "Box remove", "Other", "Unknown"],
+        saved.get("adjustment_type", saved.get("motion_response_type")),
+    )
+    pressure_family_options, pressure_family_index = _options_with_saved(
+        ["", "Standard rush", "Blitz", "Sim pressure", "Creeper", "Zero pressure", "Unknown"],
+        saved.get("pressure_family"),
     )
 
     with st.form(key=f"chart_form_{widget_prefix}"):
@@ -605,27 +613,47 @@ def main():
                 ["Unknown", "No", "Yes"],
                 index=["Unknown", "No", "Yes"].index(_saved_yes_no(saved, "blitz")),
             )
+            pressure_family = st.selectbox(
+                "Pressure family",
+                pressure_family_options,
+                index=pressure_family_index,
+                help=(
+                    "Standard rush = normal rush structure; Blitz = 5+ rushers; "
+                    "Sim pressure/Creeper = four-man pressure with a non-traditional rusher."
+                ),
+            )
+            pressure_source = st.text_input(
+                "Pressure source",
+                value=_saved_text(saved, "pressure_source"),
+                placeholder="Example: Will / Nickel / Boundary CB / Safety",
+            )
             pressure_type = st.text_input(
-                "Pressure type",
+                "Pressure detail",
                 value=_saved_text(saved, "pressure_type"),
-                placeholder="LB / DB / Sim / Zero / Other",
+                placeholder="Optional detail: boundary CB replace, cross-dog, etc.",
             )
 
-            st.markdown("##### Defensive response to motion")
+            st.markdown("##### Defensive pre-snap adjustment")
+            adjustment_trigger = st.selectbox(
+                "Adjustment trigger",
+                trigger_options,
+                index=trigger_index,
+                help="What caused or describes the pre-snap defensive movement.",
+            )
             motion_response_type = st.selectbox(
-                "Response type",
+                "Adjustment type",
                 response_options,
                 index=response_index,
             )
             motion_response_player = st.text_input(
-                "Defender responding",
-                value=_saved_text(saved, "motion_response_player"),
+                "Defender adjusting",
+                value=_saved_text(saved, "adjustment_player", _saved_text(saved, "motion_response_player")),
                 placeholder="Example: Will LB / nickel / safety",
             )
             motion_response = st.text_input(
-                "Response detail",
-                value=_saved_text(saved, "motion_response"),
-                placeholder="Example: Will bumps outside box with RB motion",
+                "Adjustment detail",
+                value=_saved_text(saved, "adjustment_detail", _saved_text(saved, "motion_response")),
+                placeholder="Example: Will bumps outside; safety rolls down; Mike inserts into box",
             )
 
             playbook_match = st.text_input(
@@ -668,13 +696,29 @@ def main():
             qc_warnings.append("Play type is Run, but Pass concept is populated.")
         if play_type == "Pass" and (run_concept.strip() or run_direction):
             qc_warnings.append("Play type is Pass, but Run concept/direction is populated.")
-        if motion_present == "No" and (
+        if adjustment_trigger == "Motion" and motion_present == "No":
+            qc_warnings.append(
+                "Defensive adjustment trigger is Motion, but Motion is marked No."
+            )
+        if adjustment_trigger == "Shift" and shift_present == "No":
+            qc_warnings.append(
+                "Defensive adjustment trigger is Shift, but Shift is marked No."
+            )
+        if adjustment_trigger in {"", "None"} and (
             motion_response_type not in {"", "None", "Unknown"}
             or motion_response_player.strip()
             or motion_response.strip()
         ):
             qc_warnings.append(
-                "Motion is marked No, but defensive response-to-motion fields are populated."
+                "A defensive adjustment is populated, but Adjustment trigger is blank/None."
+            )
+        if pressure_family == "Blitz" and int(rushers) < 5:
+            qc_warnings.append(
+                "Pressure family is Blitz, but fewer than 5 rushers are charted."
+            )
+        if pressure_family in {"Sim pressure", "Creeper"} and int(rushers) != 4:
+            qc_warnings.append(
+                f"Pressure family is {pressure_family}, but rushers is not 4."
             )
 
         if qc_warnings:
@@ -740,7 +784,13 @@ def main():
             "coverage": coverage or None,
             "rushers": int(rushers),
             "blitz": None if blitz == "Unknown" else blitz == "Yes",
+            "pressure_family": pressure_family or None,
+            "pressure_source": pressure_source or None,
             "pressure_type": pressure_type or None,
+            "adjustment_trigger": adjustment_trigger or None,
+            "adjustment_type": motion_response_type or None,
+            "adjustment_player": motion_response_player or None,
+            "adjustment_detail": motion_response or None,
             "motion_response_type": motion_response_type or None,
             "motion_response_player": motion_response_player or None,
             "motion_response": motion_response or None,
