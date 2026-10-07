@@ -120,6 +120,24 @@ class TemporalEvidenceChart(BaseModel):
     evidence_notes: str = ""
 
 
+
+
+class TemporalDiagnosticV32(BaseModel):
+    """Small required schema to test whether temporal still frames carry usable football evidence."""
+
+    snap_frame_index: int = Field(ge=1, le=12)
+    snap_timestamp_seconds: float = Field(ge=0)
+    formation_family: Literal["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]
+    rb_initial_side: Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]
+    rb_final_side: Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]
+    rb_changed_sides: bool
+    initial_box_count: int = Field(ge=0, le=11)
+    snap_box_count: int = Field(ge=0, le=11)
+    actual_rusher_count: int = Field(ge=0, le=11)
+    confidence: float = Field(ge=0, le=1)
+    evidence_notes: str
+
+
 class StructurePass(BaseModel):
     """Mechanical pre-snap observations. Avoid football shorthand when possible."""
 
@@ -699,6 +717,73 @@ IMPORTANT
 - Prefer Unknown/null over football-default guessing.
 - In evidence_notes, cite useful FRAME numbers for the snap, initial alignment, final alignment,
   movement/shift, rush count, and coverage when those observations are visible.
+"""
+
+
+
+
+def _temporal_diagnostic_prompt_v32(play_context: dict, evidence: dict) -> str:
+    context = _context(play_context)
+    frame_map = "\n".join(
+        f"FRAME {item['frame_index']:02d} = {item['timestamp_seconds']:.2f}s"
+        for item in evidence.get("frames", [])
+    )
+
+    return f"""
+You are performing a SMALL DIAGNOSTIC TEST on one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+You receive 12 individual high-resolution images from the SAME play in chronological order.
+Read FRAME 01 through FRAME 12 in order.
+
+Timeline:
+{frame_map}
+
+Return ONLY these observations. Every field is required.
+
+1. snap_frame_index
+   Pick the frame nearest the instant the ball is snapped.
+
+2. snap_timestamp_seconds
+   Use the supplied timestamp for that frame.
+
+3. formation_family
+   Choose Gun, Pistol, Under Center, Goalline, Other, or Unknown.
+
+4. rb_initial_side
+   In the EARLIEST settled pre-snap alignment, identify the primary RB relative to the QB:
+   Left, Right, Behind, Multiple, None, or Unknown.
+
+5. rb_final_side
+   In the LAST pre-snap alignment before the snap, identify the primary RB relative to the QB
+   using the same choices.
+
+6. rb_changed_sides
+   True only if the chronological frames show the RB changing from one side/alignment to another.
+
+7. initial_box_count
+   Best visual count of defenders structurally in the run box in the EARLIEST settled pre-snap frame.
+   Count LOS/edge defenders plus second-level defenders clearly committed to the box.
+
+8. snap_box_count
+   Best visual count of defenders structurally in the run box immediately before the snap.
+
+9. actual_rusher_count
+   Use the POST-SNAP frames. Count defenders whose actual post-snap action attacks the LOS,
+   backfield, QB, or pass protection. Do not count bluffing defenders who drop into coverage.
+   Do not stop counting at four.
+
+DIAGNOSTIC RULES:
+- This is intentionally a narrow visual task. Do not analyze personnel, coverage, concepts, shell,
+  motion type, pressure family, or defensive personnel.
+- Compare EARLY PRE-SNAP and FINAL PRE-SNAP as different moments.
+- Make the best visual count for box defenders and rushers instead of leaving those counts blank.
+- Use Unknown for an RB side or formation only when the images truly do not support a choice.
+- CFBD play-by-play is outcome context only and must not determine these visual observations.
+- evidence_notes should briefly cite the FRAME numbers that support the snap, RB change/no-change,
+  box counts, and rusher count.
 """
 
 
@@ -1585,6 +1670,124 @@ def analyze_clip_gemini_v31(
         },
         "_passes": {
             "temporal_frames": chart.model_dump(),
+        },
+    }
+    return result
+
+
+
+
+def analyze_clip_gemini_v32_diagnostic(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V3.2 diagnostic: same 12 high-resolution frames as V3.1, but only a tiny required schema.
+
+    This is not intended as the final scouting chart. It tests whether Flash-Lite can recover
+    temporal football evidence from individual still frames before more fields are added back.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    evidence_dir = Path("local_data") / "temporal_evidence_v32" / source.stem
+    evidence = extract_temporal_frames_v31(
+        clip_path=source,
+        output_dir=evidence_dir,
+        width=1280,
+    )
+
+    client = genai.Client(api_key=api_key)
+    chart = _call_structured_images_v31(
+        client=client,
+        model=model,
+        evidence=evidence,
+        prompt=_temporal_diagnostic_prompt_v32(play_context, evidence),
+        schema=TemporalDiagnosticV32,
+    )
+
+    initial_backfield = _backfield_from_shape_and_side(None, chart.rb_initial_side)
+    final_backfield = _backfield_from_shape_and_side(None, chart.rb_final_side)
+    blitz, pressure_family = _derive_pressure(chart.actual_rusher_count, None)
+
+    # Map the diagnostic observations onto the normal prediction keys where possible so
+    # the existing human-vs-AI benchmark table can still display relevant matches.
+    result = {
+        "personnel": None,
+        "formation_family": chart.formation_family,
+        "initial_formation": None,
+        "initial_backfield": initial_backfield,
+        "final_formation": None,
+        "final_backfield": final_backfield,
+        "formation_strength": None,
+
+        "motion_present": None,
+        "motion_player": None,
+        "motion_type": None,
+        "motion_direction": None,
+        "motion_start_alignment": None,
+        "motion_end_alignment": None,
+        "shift_present": chart.rb_changed_sides,
+        "shift_description": (
+            f"Diagnostic RB side change: {chart.rb_initial_side} -> {chart.rb_final_side}"
+            if chart.rb_changed_sides else "Diagnostic saw no RB side change"
+        ),
+
+        "film_play_type": None,
+        "run_concept": None,
+        "run_direction": None,
+        "pass_concept": None,
+        "rpo": None,
+        "play_action": None,
+
+        "defensive_personnel": None,
+        "front": None,
+        "initial_box_count": chart.initial_box_count,
+        "snap_box_count": chart.snap_box_count,
+        "shell": None,
+        "coverage": None,
+        "rushers": chart.actual_rusher_count,
+        "blitz": blitz,
+        "pressure_family": pressure_family,
+        "pressure_source": None,
+
+        "adjustment_trigger": None,
+        "adjustment_type": None,
+        "adjustment_player": None,
+        "adjustment_detail": None,
+
+        "overall_confidence": chart.confidence,
+        "uncertain_fields": [],
+        "analysis_notes": chart.evidence_notes,
+
+        "_model": model,
+        "_provider": "google-gemini",
+        "_analyzer_version": "v3.2-temporal-diagnostic",
+        "_diagnostic_only": True,
+        "_temporal_evidence": {
+            "duration_seconds": evidence["duration_seconds"],
+            "frame_count": evidence["frame_count"],
+            "frames": evidence["frames"],
+            "reading_order": evidence["reading_order"],
+            "snap_frame_index": chart.snap_frame_index,
+            "snap_timestamp_seconds": chart.snap_timestamp_seconds,
+        },
+        "_diagnostic": {
+            "snap_frame_index": chart.snap_frame_index,
+            "snap_timestamp_seconds": chart.snap_timestamp_seconds,
+            "formation_family": chart.formation_family,
+            "rb_initial_side": chart.rb_initial_side,
+            "rb_final_side": chart.rb_final_side,
+            "rb_changed_sides": chart.rb_changed_sides,
+            "initial_box_count": chart.initial_box_count,
+            "snap_box_count": chart.snap_box_count,
+            "actual_rusher_count": chart.actual_rusher_count,
+            "confidence": chart.confidence,
+            "evidence_notes": chart.evidence_notes,
         },
     }
     return result
