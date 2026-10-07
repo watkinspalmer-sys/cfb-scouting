@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -7,10 +8,16 @@ import pandas as pd
 import streamlit as st
 
 from analytics.benchmark import category_summary, compare_prediction, score_prediction
-from data.ai_store import save_ai_prediction
+from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2
+
+
+ANALYZERS = {
+    "V2 specialized 3-pass (recommended)": ("v2-specialized", analyze_clip_gemini_v2),
+    "V1 single-pass baseline": ("v1-single-pass", analyze_clip_gemini),
+}
 
 
 def _secret(name: str, default=None):
@@ -63,11 +70,9 @@ def _clip_path(row: pd.Series) -> Path:
 
 
 def _build_side_lookup(reviewed: pd.DataFrame, cfbd_key: str | None) -> dict[str, str]:
-    """Infer chart-team side for older rows that predate the chart_side column."""
     lookup: dict[str, str] = {}
     if not cfbd_key:
         return lookup
-
     group_columns = ["team", "year", "week"]
     if not set(group_columns).issubset(reviewed.columns):
         return lookup
@@ -79,7 +84,6 @@ def _build_side_lookup(reviewed: pd.DataFrame, cfbd_key: str | None) -> dict[str
             continue
         if plays.empty or "id" not in plays.columns:
             continue
-
         for _, play in plays.iterrows():
             play_id = _id_text(play.get("id"))
             offense = str(_clean(play.get("offense"), ""))
@@ -88,7 +92,6 @@ def _build_side_lookup(reviewed: pd.DataFrame, cfbd_key: str | None) -> dict[str
                 lookup[play_id] = "offense"
             elif defense == str(team):
                 lookup[play_id] = "defense"
-
     return lookup
 
 
@@ -119,20 +122,13 @@ def _render_comparison(human: pd.Series, prediction: dict):
     m1.metric("Exact benchmark matches", f"{matches}/{total}" if total else "—")
     m2.metric("Exact-match accuracy", f"{accuracy:.0%}" if accuracy is not None else "—")
     confidence = prediction.get("overall_confidence")
-    m3.metric(
-        "AI overall confidence",
-        f"{float(confidence):.0%}" if confidence is not None else "—",
-    )
+    m3.metric("AI overall confidence", f"{float(confidence):.0%}" if confidence is not None else "—")
 
     display = comparison.copy()
     display["Result"] = display.apply(
-        lambda row: (
-            "✅"
-            if row["Scored"] and row["Match"] is True
-            else "❌"
-            if row["Scored"] and row["Match"] is False
-            else "Review"
-        ),
+        lambda row: "✅" if row["Scored"] and row["Match"] is True
+        else "❌" if row["Scored"] and row["Match"] is False
+        else "Review",
         axis=1,
     )
     st.dataframe(
@@ -144,12 +140,29 @@ def _render_comparison(human: pd.Series, prediction: dict):
     uncertain = prediction.get("uncertain_fields") or []
     if uncertain:
         st.write("**AI says a human should review:**", ", ".join(map(str, uncertain)))
-
     notes = prediction.get("analysis_notes")
     if notes:
         st.write("**AI notes:**", notes)
-
     return comparison, matches, total, accuracy
+
+
+def _run_analyzer(
+    analyzer_fn,
+    clip_path: Path,
+    human: pd.Series,
+    side: str,
+    use_play_text: bool,
+    api_key: str,
+    model: str,
+    video_fps: float,
+):
+    return analyzer_fn(
+        clip_path=clip_path,
+        play_context=_play_context(human, side, use_play_text),
+        api_key=api_key,
+        model=model.strip(),
+        fps=float(video_fps),
+    )
 
 
 def _render_single(
@@ -159,6 +172,9 @@ def _render_single(
     model: str,
     video_fps: float,
     use_play_text: bool,
+    analyzer_label: str,
+    analyzer_version: str,
+    analyzer_fn,
 ):
     labels = [_play_label(row, idx) for idx, (_, row) in enumerate(reviewed.iterrows())]
     selected_idx = st.selectbox(
@@ -180,10 +196,7 @@ def _render_single(
     if clip_path.exists():
         st.video(str(clip_path))
     else:
-        st.error(
-            f"Extracted clip not found at {clip_path}. Reopen this play in Film Lab "
-            "and click Extract clip first."
-        )
+        st.error(f"Extracted clip not found at {clip_path}.")
 
     inferred_side = _row_side(human, side_lookup)
     default_role = 1 if inferred_side == "defense" else 0
@@ -196,27 +209,24 @@ def _render_single(
     )
 
     analyze_clicked = st.button(
-        "Analyze snap with AI",
+        f"Analyze snap with {analyzer_label}",
         type="primary",
         disabled=(not bool(api_key) or not clip_path.exists()),
         key="single_analyze",
     )
 
     result_key = (
-        f"ai_result_{_id_text(human.get('game_id'))}_"
-        f"{_id_text(human.get('play_id'))}_{model}_{video_fps}_{use_play_text}"
+        f"ai_result_{_id_text(human.get('game_id'))}_{_id_text(human.get('play_id'))}_"
+        f"{model}_{video_fps}_{use_play_text}_{analyzer_version}"
     )
+
     if analyze_clicked:
         try:
-            with st.spinner(
-                f"Uploading the snap and asking {model} to analyze at {video_fps:.1f} FPS..."
-            ):
-                prediction = analyze_clip_gemini(
-                    clip_path=clip_path,
-                    play_context=_play_context(human, role.lower(), use_play_text),
-                    api_key=api_key,
-                    model=model.strip(),
-                    fps=float(video_fps),
+            passes = "three specialized passes" if analyzer_version == "v2-specialized" else "one pass"
+            with st.spinner(f"Analyzing with {passes} using {model} at {video_fps:.1f} FPS..."):
+                prediction = _run_analyzer(
+                    analyzer_fn, clip_path, human, role.lower(), use_play_text,
+                    api_key, model, video_fps,
                 )
             st.session_state[result_key] = prediction
         except Exception as exc:
@@ -224,19 +234,18 @@ def _render_single(
 
     prediction = st.session_state.get(result_key)
     if not prediction:
-        st.info(
-            "Run the analyzer on one validated play to see a field-by-field comparison."
-        )
+        st.info("Run the analyzer on one validated play to see a field-by-field comparison.")
         return
 
     st.divider()
     st.subheader("AI vs. validated chart")
-    comparison, matches, total, _ = _render_comparison(human, prediction)
+    _, matches, total, _ = _render_comparison(human, prediction)
 
     saved_path = save_ai_prediction(
         game_id=_id_text(human.get("game_id")),
         play_id=_id_text(human.get("play_id")),
         model=model.strip(),
+        analyzer_version=analyzer_version,
         chart_side=role.lower(),
         prediction=prediction,
         score_matches=matches,
@@ -246,8 +255,71 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
+    if analyzer_version == "v2-specialized":
+        derived = prediction.get("_derived") or {}
+        pass_conf = prediction.get("_pass_confidence") or {}
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Observed RBs", derived.get("rb_count", "—"))
+        d2.metric("Observed TEs", derived.get("te_count", "—"))
+        d3.metric("Derived personnel", prediction.get("personnel", "—"))
+        d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
+        st.caption(
+            "V2 derives personnel from RB/TE counts and blitz from actual rusher count "
+            "instead of asking the model to guess the shorthand."
+        )
+        if pass_conf:
+            st.write("**Pass confidence:**", pass_conf)
+
     with st.expander("Raw AI chart"):
         st.json(prediction)
+
+
+def _stored_v1_accuracy(reviewed: pd.DataFrame, model: str, video_fps: float, use_play_text: bool):
+    stored = load_ai_predictions()
+    if stored.empty or "prediction_json" not in stored.columns:
+        return None
+
+    version = stored.get("analyzer_version")
+    if version is None:
+        stored = stored.assign(analyzer_version="v1-single-pass")
+    else:
+        stored["analyzer_version"] = stored["analyzer_version"].fillna("v1-single-pass")
+
+    candidates = stored[
+        stored["model"].astype(str).eq(model)
+        & stored["analyzer_version"].astype(str).eq("v1-single-pass")
+    ].copy()
+
+    if "video_fps" in candidates.columns:
+        candidates = candidates[pd.to_numeric(candidates["video_fps"], errors="coerce").eq(video_fps)]
+    if "use_play_text" in candidates.columns:
+        candidates = candidates[
+            candidates["use_play_text"].astype(str).str.lower().eq(str(use_play_text).lower())
+        ]
+
+    if candidates.empty:
+        return None
+
+    human_by_play = {_id_text(row.get("play_id")): row for _, row in reviewed.iterrows()}
+    matches = total = plays = 0
+    for _, stored_row in candidates.iterrows():
+        play_id = _id_text(stored_row.get("play_id"))
+        human = human_by_play.get(play_id)
+        if human is None:
+            continue
+        try:
+            pred = json.loads(stored_row["prediction_json"])
+        except Exception:
+            continue
+        comp = compare_prediction(human.to_dict(), pred)
+        m, t, _ = score_prediction(comp)
+        matches += m
+        total += t
+        plays += 1
+
+    if not total:
+        return None
+    return {"plays": plays, "matches": matches, "total": total, "accuracy": matches / total}
 
 
 def _render_batch(
@@ -257,16 +329,16 @@ def _render_batch(
     model: str,
     video_fps: float,
     use_play_text: bool,
+    analyzer_label: str,
+    analyzer_version: str,
+    analyzer_fn,
 ):
     st.write(
         "Run every reviewed benchmark clip sequentially. Each successful prediction "
-        "is saved immediately, so one failed play will not erase the rest of the run."
+        "is saved immediately; individual failures do not erase completed plays."
     )
 
-    eligible = []
-    missing_clips = []
-    missing_sides = []
-
+    eligible, missing_clips, missing_sides = [], [], []
     for idx, row in reviewed.iterrows():
         clip = _clip_path(row)
         side = _row_side(row, side_lookup)
@@ -278,19 +350,23 @@ def _render_batch(
             continue
         eligible.append((idx, row, clip, side))
 
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Reviewed plays", len(reviewed))
     m2.metric("Ready for batch", len(eligible))
-    m3.metric("Model", model)
+    m3.metric("Analyzer", analyzer_version)
+    m4.metric("Model", model)
+
+    if analyzer_version == "v2-specialized":
+        st.info(
+            "V2 uploads each clip once, then makes 3 Gemini analysis calls against that upload: "
+            "structure, movement, and post-snap. This uses more free-tier requests than V1, "
+            "but stays on the same Flash-Lite model."
+        )
 
     if missing_clips:
         st.warning(f"{len(missing_clips)} reviewed play(s) do not have an extracted clip.")
     if missing_sides:
-        st.warning(
-            f"{len(missing_sides)} play(s) could not be identified as offense or defense. "
-            "Re-save those plays once in Film Lab if needed."
-        )
-
+        st.warning(f"{len(missing_sides)} play(s) could not be identified as offense or defense.")
     if not api_key:
         st.warning("GEMINI_API_KEY is not configured.")
         return
@@ -299,17 +375,14 @@ def _render_batch(
         return
 
     run_batch = st.button(
-        f"Run all {len(eligible)} benchmark plays",
+        f"Run all {len(eligible)} plays with {analyzer_label}",
         type="primary",
-        key="run_batch",
+        key=f"run_batch_{analyzer_version}",
     )
 
-    batch_key = f"batch_{model}_{video_fps}_{use_play_text}"
+    batch_key = f"batch_{model}_{video_fps}_{use_play_text}_{analyzer_version}"
     if run_batch:
-        summaries = []
-        comparisons = []
-        errors = []
-
+        summaries, comparisons, errors = [], [], []
         progress = st.progress(0.0, text="Starting batch benchmark...")
         status = st.empty()
 
@@ -317,20 +390,15 @@ def _render_batch(
             label = _play_label(human, idx)
             status.write(
                 f"Analyzing {position}/{len(eligible)} — {label} "
-                f"({side}, {video_fps:.1f} FPS)"
+                f"({side}, {analyzer_version}, {video_fps:.1f} FPS)"
             )
-
             try:
-                prediction = analyze_clip_gemini(
-                    clip_path=clip_path,
-                    play_context=_play_context(human, side, use_play_text),
-                    api_key=api_key,
-                    model=model.strip(),
-                    fps=float(video_fps),
+                prediction = _run_analyzer(
+                    analyzer_fn, clip_path, human, side, use_play_text,
+                    api_key, model, video_fps,
                 )
                 comparison = compare_prediction(human.to_dict(), prediction)
                 matches, total, accuracy = score_prediction(comparison)
-
                 comparison["play_id"] = _id_text(human.get("play_id"))
                 comparison["clock"] = _clean(human.get("clock"), "")
                 comparison["chart_side"] = side
@@ -340,6 +408,7 @@ def _render_batch(
                     game_id=_id_text(human.get("game_id")),
                     play_id=_id_text(human.get("play_id")),
                     model=model.strip(),
+                    analyzer_version=analyzer_version,
                     chart_side=side,
                     prediction=prediction,
                     score_matches=matches,
@@ -347,47 +416,37 @@ def _render_batch(
                     video_fps=float(video_fps),
                     use_play_text=bool(use_play_text),
                 )
-
-                summaries.append(
-                    {
-                        "Play": position,
-                        "Play ID": _id_text(human.get("play_id")),
-                        "Quarter": _clean(human.get("period"), ""),
-                        "Clock": _clean(human.get("clock"), ""),
-                        "Side": side.title(),
-                        "Matches": matches,
-                        "Scored fields": total,
-                        "Accuracy": accuracy,
-                        "AI confidence": prediction.get("overall_confidence"),
-                        "Status": "Success",
-                    }
-                )
+                summaries.append({
+                    "Play": position,
+                    "Play ID": _id_text(human.get("play_id")),
+                    "Quarter": _clean(human.get("period"), ""),
+                    "Clock": _clean(human.get("clock"), ""),
+                    "Side": side.title(),
+                    "Matches": matches,
+                    "Scored fields": total,
+                    "Accuracy": accuracy,
+                    "AI confidence": prediction.get("overall_confidence"),
+                    "Status": "Success",
+                })
             except Exception as exc:
                 message = str(exc)
                 errors.append({"Play": label, "Error": message})
-                summaries.append(
-                    {
-                        "Play": position,
-                        "Play ID": _id_text(human.get("play_id")),
-                        "Quarter": _clean(human.get("period"), ""),
-                        "Clock": _clean(human.get("clock"), ""),
-                        "Side": side.title(),
-                        "Matches": None,
-                        "Scored fields": None,
-                        "Accuracy": None,
-                        "AI confidence": None,
-                        "Status": f"Error: {message[:120]}",
-                    }
-                )
+                summaries.append({
+                    "Play": position,
+                    "Play ID": _id_text(human.get("play_id")),
+                    "Quarter": _clean(human.get("period"), ""),
+                    "Clock": _clean(human.get("clock"), ""),
+                    "Side": side.title(),
+                    "Matches": None,
+                    "Scored fields": None,
+                    "Accuracy": None,
+                    "AI confidence": None,
+                    "Status": f"Error: {message[:120]}",
+                })
 
-            progress.progress(
-                position / len(eligible),
-                text=f"Completed {position}/{len(eligible)} benchmark plays",
-            )
-
-            # Stay conservative with free-tier request limits.
+            progress.progress(position / len(eligible), text=f"Completed {position}/{len(eligible)}")
             if position < len(eligible):
-                time.sleep(6)
+                time.sleep(8 if analyzer_version == "v2-specialized" else 6)
 
         detail = pd.concat(comparisons, ignore_index=True) if comparisons else pd.DataFrame()
         st.session_state[batch_key] = {
@@ -399,16 +458,10 @@ def _render_batch(
 
     result = st.session_state.get(batch_key)
     if not result:
-        st.info(
-            "The batch will use the same model, 5 FPS setting, and CFBD-context choice "
-            "shown above."
-        )
+        st.info("Run the batch to produce the new benchmark.")
         return
 
-    summary = result["summary"]
-    detail = result["detail"]
-    errors = result["errors"]
-
+    summary, detail, errors = result["summary"], result["detail"], result["errors"]
     st.divider()
     st.subheader("Batch benchmark results")
 
@@ -424,13 +477,21 @@ def _render_batch(
     avg_conf = successful["AI confidence"].dropna().mean() if not successful.empty else None
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
+    baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
+    if analyzer_version == "v2-specialized" and baseline is not None and overall_accuracy is not None:
+        st.subheader("V1 vs V2")
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Stored V1 baseline",
+            f"{baseline['accuracy']:.0%}",
+            help=f"{baseline['matches']}/{baseline['total']} across {baseline['plays']} stored plays",
+        )
+        c2.metric("V2 specialized", f"{overall_accuracy:.0%}")
+        c3.metric("Change", f"{overall_accuracy - baseline['accuracy']:+.1%}")
+
     table = summary.copy()
-    table["Accuracy"] = table["Accuracy"].map(
-        lambda value: f"{value:.0%}" if pd.notna(value) else ""
-    )
-    table["AI confidence"] = table["AI confidence"].map(
-        lambda value: f"{value:.0%}" if pd.notna(value) else ""
-    )
+    table["Accuracy"] = table["Accuracy"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "")
+    table["AI confidence"] = table["AI confidence"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "")
     st.dataframe(table, hide_index=True, use_container_width=True)
 
     categories = category_summary(detail)
@@ -444,11 +505,10 @@ def _render_batch(
         with st.expander(f"Batch errors ({len(errors)})"):
             st.dataframe(errors, hide_index=True, use_container_width=True)
 
-    csv_bytes = summary.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download batch summary CSV",
-        data=csv_bytes,
-        file_name="ai_benchmark_summary.csv",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name=f"ai_benchmark_{analyzer_version}.csv",
         mime="text/csv",
     )
 
@@ -457,8 +517,9 @@ def main():
     st.set_page_config(page_title="AI Analyzer", layout="wide")
     st.title("AI Analyzer")
     st.caption(
-        "Use Gemini native video analysis to chart football snaps and benchmark "
-        "its structured output against your validated Film Lab data."
+        "Benchmark Gemini video analysis against validated Film Lab data. "
+        "V2 separates structure, movement, and post-snap recognition, then derives "
+        "football shorthand with deterministic rules."
     )
 
     chart = load_film_chart()
@@ -466,15 +527,10 @@ def main():
         st.warning("No reviewed film chart exists yet. Chart benchmark plays in Film Lab first.")
         return
 
-    if "reviewed" in chart.columns:
-        reviewed = chart[chart["reviewed"].map(_truthy)].copy()
-    else:
-        reviewed = chart.copy()
-
+    reviewed = chart[chart["reviewed"].map(_truthy)].copy() if "reviewed" in chart.columns else chart.copy()
     if reviewed.empty:
         st.warning("No plays are marked Reviewed / validated.")
         return
-
     reviewed = reviewed.reset_index(drop=True)
 
     api_key = _secret("GEMINI_API_KEY")
@@ -482,10 +538,18 @@ def main():
     model_default = _secret("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
     st.markdown("### Analysis settings")
+    analyzer_label = st.selectbox(
+        "Analyzer version",
+        options=list(ANALYZERS.keys()),
+        index=0,
+        help="Use V2 for the new specialized benchmark. V1 remains available as the baseline.",
+    )
+    analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
+
     model = st.text_input(
         "Gemini model",
         value=str(model_default),
-        help="Keep gemini-3.1-flash-lite for the cheapest benchmark path.",
+        help="Keep gemini-3.1-flash-lite for the cheapest path.",
     )
     video_fps = st.slider(
         "Video sampling FPS",
@@ -493,45 +557,30 @@ def main():
         max_value=5.0,
         value=5.0,
         step=0.5,
-        help="5 FPS is our current benchmark baseline.",
+        help="5 FPS is the current benchmark baseline.",
     )
     use_play_text = st.checkbox(
         "Give the model CFBD play-by-play context",
         value=True,
-        help=(
-            "Production scouting combines structured PBP with film. Turn this off "
-            "only for a harder vision-only benchmark."
-        ),
+        help="PBP is outcome context only; prompts explicitly forbid it from deciding film labels.",
     )
 
     if not api_key:
-        st.warning(
-            "GEMINI_API_KEY is not configured. Add it to .streamlit/secrets.toml "
-            "before running the analyzer."
-        )
+        st.warning("GEMINI_API_KEY is not configured in .streamlit/secrets.toml.")
 
     side_lookup = _build_side_lookup(reviewed, cfbd_key)
-
     single_tab, batch_tab = st.tabs(["Single snap", "Batch benchmark"])
 
     with single_tab:
         _render_single(
-            reviewed=reviewed,
-            side_lookup=side_lookup,
-            api_key=api_key,
-            model=model,
-            video_fps=video_fps,
-            use_play_text=use_play_text,
+            reviewed, side_lookup, api_key, model, video_fps, use_play_text,
+            analyzer_label, analyzer_version, analyzer_fn,
         )
 
     with batch_tab:
         _render_batch(
-            reviewed=reviewed,
-            side_lookup=side_lookup,
-            api_key=api_key,
-            model=model,
-            video_fps=video_fps,
-            use_play_text=use_play_text,
+            reviewed, side_lookup, api_key, model, video_fps, use_play_text,
+            analyzer_label, analyzer_version, analyzer_fn,
         )
 
 
