@@ -315,3 +315,139 @@ def extract_temporal_frames_v31(
         "frames": frames,
         "reading_order": "Read frame_01 through frame_12 in numeric order.",
     }
+
+
+def extract_frames_at_timestamps(
+    clip_path: str | Path,
+    output_dir: str | Path,
+    timestamps: list[float],
+    width: int = 1280,
+    prefix: str = "frame",
+) -> list[dict]:
+    """Extract individual JPEGs at explicit clip-relative timestamps."""
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    destination = Path(output_dir)
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    duration = probe_duration(source)
+    frames: list[dict] = []
+    seen_timestamps: set[float] = set()
+
+    for requested_index, requested in enumerate(timestamps, start=1):
+        timestamp = min(max(float(requested), 0.0), max(duration - 0.02, 0.0))
+        rounded = round(timestamp, 3)
+
+        # Clamping near the clip boundaries can turn several requested offsets into
+        # the same physical frame. Keep only one copy.
+        if rounded in seen_timestamps:
+            continue
+        seen_timestamps.add(rounded)
+
+        frame_index = len(frames) + 1
+        frame_path = destination / f"{prefix}_{frame_index:02d}.jpg"
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{timestamp:.3f}",
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={int(width)}:-2",
+                "-q:v",
+                "2",
+                str(frame_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Unknown FFmpeg error").strip()
+            raise RuntimeError(detail)
+
+        frames.append(
+            {
+                "frame_index": frame_index,
+                "requested_index": requested_index,
+                "timestamp_seconds": rounded,
+                "path": str(frame_path),
+            }
+        )
+
+    return frames
+
+
+def extract_snap_centered_frames_v34(
+    clip_path: str | Path,
+    output_dir: str | Path,
+    snap_timestamp_seconds: float,
+    width: int = 1280,
+) -> dict:
+    """
+    Extract a dense football-relative timeline around an estimated snap.
+
+    Offsets intentionally preserve a long pre-snap runway for shifts and a dense
+    first three seconds after the snap for rush/coverage identification.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    snap = float(snap_timestamp_seconds)
+    offsets = [
+        -5.0,
+        -4.0,
+        -3.0,
+        -2.0,
+        -1.5,
+        -1.0,
+        -0.5,
+        -0.2,
+        0.2,
+        0.4,
+        0.7,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+    ]
+    requested_timestamps = [snap + offset for offset in offsets]
+    frames = extract_frames_at_timestamps(
+        clip_path=source,
+        output_dir=output_dir,
+        timestamps=requested_timestamps,
+        width=width,
+        prefix="snap",
+    )
+
+    # Reconstruct football-relative offsets from the actual extracted timestamp
+    # after any clip-boundary clamping/deduplication.
+    for item in frames:
+        relative = round(float(item["timestamp_seconds"]) - snap, 3)
+        item["relative_to_snap_seconds"] = relative
+        if relative < -0.05:
+            item["phase"] = "pre_snap"
+        elif relative > 0.05:
+            item["phase"] = "post_snap"
+        else:
+            item["phase"] = "snap"
+
+    return {
+        "clip_path": str(source),
+        "duration_seconds": probe_duration(source),
+        "estimated_snap_timestamp_seconds": round(snap, 3),
+        "frame_count": len(frames),
+        "frames": frames,
+        "reading_order": "Read frames in ascending frame_index; each frame includes seconds relative to the estimated snap.",
+    }
+
