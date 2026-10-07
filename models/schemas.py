@@ -12,10 +12,26 @@ class FilmObservation:
     # Offense
     personnel: Optional[str] = None
     formation_family: Optional[str] = None
-    formation: Optional[str] = None
+
+    # Formation evolution from huddle/set through the snap.
+    initial_formation: Optional[str] = None
+    initial_backfield: Optional[str] = None
+    formation: Optional[str] = None  # Backward-compatible alias for final_formation.
+    final_formation: Optional[str] = None
+    final_backfield: Optional[str] = None
     formation_strength: Optional[str] = None
-    motion: Optional[str] = None
-    shift: Optional[str] = None
+
+    # Motion and shift details.
+    motion_present: Optional[bool] = None
+    motion_player: Optional[str] = None
+    motion_type: Optional[str] = None
+    motion_direction: Optional[str] = None
+    motion_start_alignment: Optional[str] = None
+    motion_end_alignment: Optional[str] = None
+    motion: Optional[str] = None  # Backward-compatible alias for motion_type.
+    shift_present: Optional[bool] = None
+    shift_description: Optional[str] = None
+    shift: Optional[str] = None  # Backward-compatible alias for shift_description.
     play_type: Optional[str] = None
     run_concept: Optional[str] = None
     run_direction: Optional[str] = None
@@ -26,12 +42,16 @@ class FilmObservation:
     # Defense
     defensive_personnel: Optional[str] = None
     front: Optional[str] = None
-    box_count: Optional[int] = None
+    pre_motion_box_count: Optional[int] = None
+    post_motion_box_count: Optional[int] = None
+    box_count: Optional[int] = None  # Backward-compatible alias for box count at snap.
     shell: Optional[str] = None
     coverage: Optional[str] = None
     rushers: Optional[int] = None
     blitz: Optional[bool] = None
     pressure_type: Optional[str] = None
+    motion_response_type: Optional[str] = None
+    motion_response_player: Optional[str] = None
     motion_response: Optional[str] = None
 
     # Video linkage
