@@ -3,3 +3,4 @@ pandas
 requests
 google-genai>=2.25.0
 pydantic
+Pillow>=10.0.0
