@@ -158,29 +158,52 @@ def analyze_clip_gemini(
         if uploaded.state and uploaded.state.name == "FAILED":
             raise RuntimeError("Gemini failed to process the uploaded video.")
 
-        interaction = client.interactions.create(
-            model=model,
-            input=[
-                {
-                    "type": "video",
-                    "uri": uploaded.uri,
-                    "mime_type": uploaded.mime_type,
-                    "processing": {
-                        "type": "static",
-                        "fps": float(fps),
+        interaction = None
+        for attempt in range(4):
+            try:
+                interaction = client.interactions.create(
+                    model=model,
+                    input=[
+                        {
+                            "type": "video",
+                            "uri": uploaded.uri,
+                            "mime_type": uploaded.mime_type,
+                            "processing": {
+                                "type": "static",
+                                "fps": float(fps),
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": _prompt(play_context),
+                        },
+                    ],
+                    response_format={
+                        "type": "text",
+                        "mime_type": "application/json",
+                        "schema": FootballSnapChart.model_json_schema(),
                     },
-                },
-                {
-                    "type": "text",
-                    "text": _prompt(play_context),
-                },
-            ],
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": FootballSnapChart.model_json_schema(),
-            },
-        )
+                )
+                break
+            except Exception as exc:
+                message = str(exc).lower()
+                retryable = any(
+                    token in message
+                    for token in (
+                        "503",
+                        "service_unavailable",
+                        "high demand",
+                        "429",
+                        "resource_exhausted",
+                        "rate limit",
+                    )
+                )
+                if not retryable or attempt == 3:
+                    raise
+                time.sleep(2 * (2 ** attempt))
+
+        if interaction is None:
+            raise RuntimeError("Gemini analysis did not return a response.")
 
         if not interaction.output_text:
             raise RuntimeError("Gemini returned no structured chart.")
