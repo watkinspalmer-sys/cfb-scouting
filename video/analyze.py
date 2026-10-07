@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from google import genai
 from pydantic import BaseModel, Field
 
 from models.schemas import FilmObservation
+from video.frames import create_temporal_evidence_sheets
 
 
 class VideoAnalyzer(Protocol):
@@ -62,6 +64,60 @@ class FootballSnapChart(BaseModel):
     overall_confidence: float = Field(ge=0, le=1)
     uncertain_fields: list[str] = Field(default_factory=list)
     analysis_notes: str = ""
+
+
+
+class TemporalEvidenceChart(BaseModel):
+    """One-pass chart from timestamped chronological contact sheets."""
+    snap_frame_index: Optional[int] = Field(default=None, ge=1)
+    snap_timestamp_seconds: Optional[float] = Field(default=None, ge=0)
+    back_count: Optional[int] = Field(default=None, ge=0, le=3)
+    attached_te_count: Optional[int] = Field(default=None, ge=0, le=3)
+    wing_hback_count: Optional[int] = Field(default=None, ge=0, le=3)
+    flexed_te_count: Optional[int] = Field(default=None, ge=0, le=3)
+    split_wr_count: Optional[int] = Field(default=None, ge=0, le=5)
+    formation_family: Optional[Literal["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]] = None
+    initial_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    final_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    formation_strength: Optional[Literal["Left", "Right", "Balanced", "Boundary", "Field", "Unknown"]] = None
+    rb_initial_side: Optional[Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]] = None
+    rb_final_side: Optional[Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]] = None
+    rb_changed_sides: Optional[bool] = None
+    rb_set_before_snap: Optional[bool] = None
+    any_player_moving_at_snap: Optional[bool] = None
+    any_alignment_change_set_before_snap: Optional[bool] = None
+    primary_mover: Optional[str] = None
+    movement_type: Optional[Literal["Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other", "Unknown"]] = None
+    movement_direction: Optional[str] = None
+    movement_start_alignment: Optional[str] = None
+    movement_end_alignment: Optional[str] = None
+    defensive_personnel: Optional[str] = None
+    front_family: Optional[Literal["Even", "Odd", "Bear", "Mint/Tite", "Other", "Unknown"]] = None
+    initial_line_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    initial_second_level_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    snap_line_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    snap_second_level_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    shell: Optional[Literal["1-High", "2-High", "0-High", "Unknown"]] = None
+    film_play_type: Optional[Literal["Run", "Pass", "RPO", "Scramble", "Sack", "Other", "Unknown"]] = None
+    run_concept: Optional[str] = None
+    run_direction: Optional[Literal["Left", "Right", "Middle", "Boundary", "Field", "Unknown"]] = None
+    pass_concept: Optional[str] = None
+    rpo: Optional[bool] = None
+    play_action: Optional[bool] = None
+    immediate_rushers_count: Optional[int] = Field(default=None, ge=0, le=11)
+    delayed_rushers_count: Optional[int] = Field(default=0, ge=0, le=11)
+    bluff_or_drop_count: Optional[int] = Field(default=None, ge=0, le=11)
+    nontraditional_rushers_count: Optional[int] = Field(default=None, ge=0, le=11)
+    pressure_family_observed: Optional[Literal["Standard rush", "Blitz", "Sim pressure", "Creeper", "Zero pressure", "Unknown"]] = None
+    pressure_source: Optional[str] = None
+    coverage: Optional[str] = None
+    adjustment_trigger: Optional[Literal["None", "Motion", "Shift", "Defensive stem", "Cadence/check", "Other", "Unknown"]] = None
+    adjustment_type: Optional[Literal["None", "Bump", "Travel", "Safety rotation", "Front shift", "Box insert", "Box remove", "Other", "Unknown"]] = None
+    adjustment_player: Optional[str] = None
+    adjustment_detail: Optional[str] = None
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    evidence_notes: str = ""
 
 
 class StructurePass(BaseModel):
@@ -494,6 +550,59 @@ Coverage:
 
 The play-by-play may provide outcome context only; it must not decide rush count, pressure, concept,
 or coverage. Prefer Unknown/null over a confident guess.
+"""
+
+
+
+def _temporal_prompt(play_context: dict, evidence: dict) -> str:
+    context = _context(play_context)
+    manifest = evidence.get("manifest", [])
+    frame_map = ", ".join(
+        f"{item['frame_index']}={item['timestamp_seconds']:.2f}s"
+        for item in manifest
+    )
+    return f"""
+You are charting ONE college football snap from ORDERED TEMPORAL EVIDENCE SHEETS.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+The attached images are contact sheets from the SAME clip. Read sheet 1, then 2, then 3.
+Within each sheet read left-to-right, top-to-bottom. Each tile is labeled FRAME ## and time.
+Global timeline:
+{frame_map}
+
+First locate the snap and return the nearest frame number and time.
+Then reason separately about EARLY PRE-SNAP, FINAL PRE-SNAP, and POST-SNAP.
+Do not overwrite an early alignment with the final alignment.
+
+PERSONNEL: Count the five non-QB/non-OL eligible players in mutually exclusive buckets:
+back_count, attached_te_count, wing_hback_count, flexed_te_count, split_wr_count.
+They should sum to 5. A player keeps his personnel identity after motion/shift. Use null if TE vs WR
+cannot be distinguished instead of defaulting to 11 personnel.
+
+RB TRACKING: Explicitly compare RB side relative to QB early vs final pre-snap.
+If side changes and he becomes set, that is a SHIFT. If still moving at the snap, that is MOTION.
+
+FORMATION: Chart QB formation family and early/final receiver distribution. Only use Field/Boundary
+strength when broadcast geometry supports it.
+
+DEFENSIVE BOX: At early and final pre-snap separately count line_box_defenders and
+second_level_box_defenders. Include tight edge defenders. Python will add the layers.
+
+SHELL/COVERAGE: shell is PRE-SNAP only; coverage is actual POST-SNAP coverage.
+A 2-High shell rotating to Cover 1 is valid.
+
+RUSHERS: Count immediate rushers, delayed rushers, bluff/drop players, and nontraditional rushers.
+Do not stop at four. Python derives total rushers and blitz at 5+.
+
+PLAY: Chart run/pass/RPO/scramble/sack and only name concepts when evidence is sufficient.
+
+DEFENSIVE ADJUSTMENT: Record visible bump, travel, safety rotation, front shift, box insert/remove,
+or other response.
+
+CFBD play-by-play is outcome context only and cannot decide film labels.
+Prefer Unknown/null over football-default guessing. In evidence_notes cite useful FRAME numbers.
 """
 
 
@@ -979,6 +1088,180 @@ def analyze_clip_gemini_v21(
                 client.files.delete(name=uploaded.name)
             except Exception:
                 pass
+
+
+
+def _call_structured_images(client, model: str, image_paths: list[str | Path], prompt: str, schema: type[BaseModel]) -> BaseModel:
+    input_items = [{"type": "text", "text": prompt}]
+    for path in image_paths:
+        image_bytes = Path(path).read_bytes()
+        input_items.append({
+            "type": "image",
+            "data": base64.b64encode(image_bytes).decode("utf-8"),
+            "mime_type": "image/jpeg",
+        })
+
+    interaction = None
+    for attempt in range(4):
+        try:
+            interaction = client.interactions.create(
+                model=model,
+                input=input_items,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": schema.model_json_schema(),
+                },
+            )
+            break
+        except Exception as exc:
+            message = str(exc).lower()
+            retryable = any(token in message for token in (
+                "503", "service_unavailable", "high demand", "429",
+                "resource_exhausted", "rate limit",
+            ))
+            if not retryable or attempt == 3:
+                raise
+            time.sleep(2 * (2 ** attempt))
+
+    if interaction is None or not interaction.output_text:
+        raise RuntimeError("Gemini returned no structured chart from temporal evidence.")
+    return schema.model_validate(json.loads(interaction.output_text))
+
+
+def analyze_clip_gemini_v3(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """V3: local timestamped evidence sheets plus one Gemini image-analysis call."""
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    evidence_dir = Path("local_data") / "temporal_evidence" / source.stem
+    evidence = create_temporal_evidence_sheets(
+        clip_path=source,
+        output_dir=evidence_dir,
+        frame_count=24,
+        sheet_count=3,
+        columns=2,
+        tile_width=640,
+        tile_height=360,
+    )
+
+    client = genai.Client(api_key=api_key)
+    chart = _call_structured_images(
+        client, model, evidence["sheet_paths"],
+        _temporal_prompt(play_context, evidence), TemporalEvidenceChart,
+    )
+
+    personnel, te_count, eligible_total = _derive_personnel_v21(
+        chart.back_count, chart.attached_te_count, chart.wing_hback_count,
+        chart.flexed_te_count, chart.split_wr_count,
+    )
+    initial_box_count = _sum_optional(chart.initial_line_box_defenders, chart.initial_second_level_box_defenders)
+    snap_box_count = _sum_optional(chart.snap_line_box_defenders, chart.snap_second_level_box_defenders)
+    initial_backfield = _backfield_from_shape_and_side(None, chart.rb_initial_side)
+    final_backfield = _backfield_from_shape_and_side(None, chart.rb_final_side)
+
+    motion_present = chart.any_player_moving_at_snap
+    shift_present = chart.any_alignment_change_set_before_snap
+    if chart.rb_changed_sides is True and chart.rb_set_before_snap is True:
+        shift_present = True
+    if chart.rb_changed_sides is True and chart.rb_set_before_snap is False:
+        motion_present = True
+
+    rushers = None
+    if chart.immediate_rushers_count is not None:
+        rushers = int(chart.immediate_rushers_count) + int(chart.delayed_rushers_count or 0)
+    blitz, pressure_family = _derive_pressure(rushers, chart.pressure_family_observed)
+
+    shift_description = None
+    if shift_present:
+        if chart.rb_changed_sides:
+            shift_description = (
+                f"RB changed from {chart.rb_initial_side} to {chart.rb_final_side} "
+                f"and {'set' if chart.rb_set_before_snap else 'did not set'} before snap"
+            )
+        elif chart.primary_mover:
+            shift_description = f"{chart.primary_mover}: {chart.movement_start_alignment} -> {chart.movement_end_alignment}"
+
+    result = {
+        "personnel": personnel,
+        "formation_family": chart.formation_family,
+        "initial_formation": chart.initial_receiver_structure,
+        "initial_backfield": initial_backfield,
+        "final_formation": chart.final_receiver_structure,
+        "final_backfield": final_backfield,
+        "formation_strength": chart.formation_strength,
+        "motion_present": motion_present,
+        "motion_player": chart.primary_mover if motion_present else None,
+        "motion_type": chart.movement_type if motion_present else None,
+        "motion_direction": chart.movement_direction if motion_present else None,
+        "motion_start_alignment": chart.movement_start_alignment if motion_present else None,
+        "motion_end_alignment": chart.movement_end_alignment if motion_present else None,
+        "shift_present": shift_present,
+        "shift_description": shift_description,
+        "film_play_type": chart.film_play_type,
+        "run_concept": chart.run_concept,
+        "run_direction": chart.run_direction,
+        "pass_concept": chart.pass_concept,
+        "rpo": chart.rpo,
+        "play_action": chart.play_action,
+        "defensive_personnel": chart.defensive_personnel,
+        "front": chart.front_family,
+        "initial_box_count": initial_box_count,
+        "snap_box_count": snap_box_count,
+        "shell": chart.shell,
+        "coverage": chart.coverage,
+        "rushers": rushers,
+        "blitz": blitz,
+        "pressure_family": pressure_family,
+        "pressure_source": chart.pressure_source,
+        "adjustment_trigger": chart.adjustment_trigger,
+        "adjustment_type": chart.adjustment_type,
+        "adjustment_player": chart.adjustment_player,
+        "adjustment_detail": chart.adjustment_detail,
+        "overall_confidence": chart.confidence,
+        "uncertain_fields": chart.uncertain_fields,
+        "analysis_notes": chart.evidence_notes,
+        "_model": model,
+        "_provider": "google-gemini",
+        "_analyzer_version": "v3-temporal-evidence",
+        "_temporal_evidence": {
+            "duration_seconds": evidence["duration_seconds"],
+            "frame_count": evidence["frame_count"],
+            "sheet_paths": evidence["sheet_paths"],
+            "snap_frame_index": chart.snap_frame_index,
+            "snap_timestamp_seconds": chart.snap_timestamp_seconds,
+        },
+        "_derived": {
+            "back_count": chart.back_count,
+            "attached_te_count": chart.attached_te_count,
+            "wing_hback_count": chart.wing_hback_count,
+            "flexed_te_count": chart.flexed_te_count,
+            "te_count": te_count,
+            "split_wr_count": chart.split_wr_count,
+            "eligible_total": eligible_total,
+            "rb_initial_side": chart.rb_initial_side,
+            "rb_final_side": chart.rb_final_side,
+            "rb_changed_sides": chart.rb_changed_sides,
+            "rb_set_before_snap": chart.rb_set_before_snap,
+            "initial_line_box_defenders": chart.initial_line_box_defenders,
+            "initial_second_level_box_defenders": chart.initial_second_level_box_defenders,
+            "snap_line_box_defenders": chart.snap_line_box_defenders,
+            "snap_second_level_box_defenders": chart.snap_second_level_box_defenders,
+            "immediate_rushers_count": chart.immediate_rushers_count,
+            "delayed_rushers_count": chart.delayed_rushers_count,
+            "bluff_or_drop_count": chart.bluff_or_drop_count,
+            "nontraditional_rushers_count": chart.nontraditional_rushers_count,
+        },
+        "_passes": {"temporal_evidence": chart.model_dump()},
+    }
+    return result
 
 
 def analyze_clip_stub(clip_path: str, play_context: dict) -> FilmObservation:
