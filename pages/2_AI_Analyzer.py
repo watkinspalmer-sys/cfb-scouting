@@ -107,7 +107,7 @@ def main():
     )
 
     api_key = _secret("OPENAI_API_KEY")
-    model_default = _secret("OPENAI_MODEL", "gpt-5")
+    model_default = _secret("OPENAI_MODEL", "gpt-6-luna")
     model = st.text_input(
         "AI model",
         value=str(model_default),
