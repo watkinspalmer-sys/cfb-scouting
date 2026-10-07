@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from data.cfbd import fetch_plays
+from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart, save_film_observation
 from video.clips import extract_clip
 from video.timecode import format_timecode, parse_timecode
@@ -92,56 +92,132 @@ def main():
             placeholder=r"C:\Football\NorthTexas_Tulsa.mp4",
         )
 
+    api_error = None
     with st.spinner("Loading CFBD plays..."):
         try:
-            plays = fetch_plays(team.strip(), int(year), int(week), key)
+            # Film Lab needs only the selected game week. This call is persisted
+            # to local_data/cfbd after the first successful download.
+            plays = fetch_week_plays(team.strip(), int(year), int(week), key)
         except Exception as exc:
-            st.error(f"Could not load plays: {exc}")
-            st.stop()
+            api_error = str(exc)
+            plays = pd.DataFrame()
 
-    if plays.empty:
-        st.warning("No plays returned for this team/week.")
-        st.stop()
-
-    # fetch_plays downloads weeks 1..selected week. Use the explicit marker
-    # added by data.cfbd because CFBD play payloads may omit a week field.
-    if "_requested_week" in plays.columns:
-        plays = plays[
-            pd.to_numeric(plays["_requested_week"], errors="coerce").eq(int(week))
-        ].copy()
-    elif "week" in plays.columns:
-        plays = plays[
-            pd.to_numeric(plays["week"], errors="coerce").eq(int(week))
-        ].copy()
-
-    if "offense" in plays.columns:
-        side = st.radio("Chart", ["Tulsa offense", "Tulsa defense"], horizontal=True)
-        if side == "Tulsa offense":
-            filtered = plays[plays["offense"].astype(str).eq(team.strip())].copy()
-        else:
-            filtered = plays[plays["defense"].astype(str).eq(team.strip())].copy()
-    else:
-        filtered = plays.copy()
-
-    # Film Lab v1 is for scrimmage scouting, not special teams.
-    if "playType" in filtered.columns:
-        scrimmage = filtered["playType"].astype(str).str.contains(
-            r"Rush|Pass|Sack", case=False, na=False, regex=True
+    manual_mode = False
+    if api_error:
+        st.warning(
+            f"CFBD is unavailable: {api_error} "
+            "You can keep charting in Manual play mode below."
         )
-        filtered = filtered[scrimmage].copy()
+        manual_mode = True
+    elif plays.empty:
+        st.warning(
+            "No CFBD plays were returned for this team/week. "
+            "You can keep charting in Manual play mode below."
+        )
+        manual_mode = True
 
-    if filtered.empty:
-        st.warning("No matching plays found for this side of the ball.")
-        st.stop()
+    if not manual_mode:
+        if "offense" in plays.columns:
+            side = st.radio(
+                "Chart",
+                [f"{team.strip()} offense", f"{team.strip()} defense"],
+                horizontal=True,
+            )
+            if side == f"{team.strip()} offense":
+                filtered = plays[plays["offense"].astype(str).eq(team.strip())].copy()
+            else:
+                filtered = plays[plays["defense"].astype(str).eq(team.strip())].copy()
+        else:
+            filtered = plays.copy()
 
-    filtered = filtered.reset_index(drop=True)
-    labels = [_play_label(row, idx) for idx, (_, row) in enumerate(filtered.iterrows())]
-    selected_idx = st.selectbox(
-        "Select play",
-        options=list(range(len(filtered))),
-        format_func=lambda i: labels[i],
-    )
-    play = filtered.iloc[selected_idx]
+        # Film Lab v1 is for scrimmage scouting, not special teams.
+        if "playType" in filtered.columns:
+            scrimmage = filtered["playType"].astype(str).str.contains(
+                r"Rush|Pass|Sack", case=False, na=False, regex=True
+            )
+            filtered = filtered[scrimmage].copy()
+
+        if filtered.empty:
+            st.warning(
+                "No matching scrimmage plays were found. "
+                "Switching to Manual play mode."
+            )
+            manual_mode = True
+
+    if manual_mode:
+        st.markdown("### Manual play entry")
+        st.caption(
+            "This keeps Film Lab usable without CFBD. Enter the game-state "
+            "information from the broadcast or official play-by-play."
+        )
+        side = st.radio(
+            "Chart",
+            [f"{team.strip()} offense", f"{team.strip()} defense"],
+            horizontal=True,
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        manual_period = m1.number_input(
+            "Quarter",
+            min_value=1,
+            max_value=5,
+            value=1,
+            step=1,
+            key="manual_period",
+        )
+        manual_clock = m2.text_input(
+            "Game clock",
+            value="15:00",
+            key="manual_clock",
+        )
+        manual_down = m3.number_input(
+            "Down",
+            min_value=1,
+            max_value=4,
+            value=1,
+            step=1,
+            key="manual_down",
+        )
+        manual_distance = m4.number_input(
+            "Distance",
+            min_value=0,
+            max_value=99,
+            value=10,
+            step=1,
+            key="manual_distance",
+        )
+        manual_play_text = st.text_input(
+            "Play description",
+            placeholder="Example: Alston rush right for 6 yards",
+            key="manual_play_text",
+        )
+
+        manual_id = (
+            f"manual-{int(year)}-{int(week)}-"
+            f"Q{int(manual_period)}-{manual_clock}-"
+            f"D{int(manual_down)}-{int(manual_distance)}"
+        ).replace(":", "")
+        play = pd.Series(
+            {
+                "id": manual_id,
+                "gameId": f"{team.strip()}-{int(year)}-week-{int(week)}",
+                "period": int(manual_period),
+                "clock": manual_clock,
+                "down": int(manual_down),
+                "distance": int(manual_distance),
+                "playText": manual_play_text,
+                "playType": "",
+            }
+        )
+        selected_idx = 0
+    else:
+        filtered = filtered.reset_index(drop=True)
+        labels = [_play_label(row, idx) for idx, (_, row) in enumerate(filtered.iterrows())]
+        selected_idx = st.selectbox(
+            "Select play",
+            options=list(range(len(filtered))),
+            format_func=lambda i: labels[i],
+        )
+        play = filtered.iloc[selected_idx]
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Quarter", _safe_text(play, "period", default="?"))
