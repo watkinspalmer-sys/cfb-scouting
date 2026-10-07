@@ -738,6 +738,7 @@ def main():
             "game_id": game_id,
             "play_id": play_id,
             "team": team.strip(),
+            "chart_side": "offense" if str(side).endswith("offense") else "defense",
             "year": int(year),
             "week": int(week),
             "period": _safe_number(play, "period"),
