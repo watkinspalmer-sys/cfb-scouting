@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, score_pred
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic
 
 
 ANALYZERS = {
-    "V3.1 temporal frames 1-pass (recommended)": ("v3.1-temporal-frames", analyze_clip_gemini_v31),
+    "V3.2 temporal diagnostic 1-pass (recommended)": ("v3.2-temporal-diagnostic", analyze_clip_gemini_v32_diagnostic),
+    "V3.1 temporal frames 1-pass": ("v3.1-temporal-frames", analyze_clip_gemini_v31),
     "V3 temporal evidence 1-pass": ("v3-temporal-evidence", analyze_clip_gemini_v3),
     "V2.1 mechanical 3-pass": ("v2.1-mechanical", analyze_clip_gemini_v21),
     "V2 specialized 3-pass": ("v2-specialized", analyze_clip_gemini_v2),
@@ -225,7 +226,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v3.1-temporal-frames":
+            if analyzer_version == "v3.2-temporal-diagnostic":
+                passes = "one narrow temporal diagnostic pass"
+            elif analyzer_version == "v3.1-temporal-frames":
                 passes = "one high-resolution temporal-frame pass"
             elif analyzer_version == "v3-temporal-evidence":
                 passes = "one temporal-evidence pass"
@@ -265,7 +268,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -274,7 +277,39 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v3.1-temporal-frames":
+        if analyzer_version == "v3.2-temporal-diagnostic":
+            st.caption(
+                "V3.2 is a diagnostic only. It uses the same 12 high-resolution temporal frames "
+                "as V3.1 but asks Gemini for only snap timing, formation family, RB start/end side, "
+                "box counts, and actual rusher count."
+            )
+            diagnostic = prediction.get("_diagnostic") or {}
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Snap frame", diagnostic.get("snap_frame_index", "—"))
+            snap_time = diagnostic.get("snap_timestamp_seconds")
+            e2.metric("Snap time", f"{snap_time:.2f}s" if isinstance(snap_time, (int, float)) else "—")
+            e3.metric("RB start", diagnostic.get("rb_initial_side", "—"))
+            e4.metric("RB final", diagnostic.get("rb_final_side", "—"))
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("RB changed", str(diagnostic.get("rb_changed_sides", "—")))
+            b2.metric("Initial box", diagnostic.get("initial_box_count", "—"))
+            b3.metric("Snap box", diagnostic.get("snap_box_count", "—"))
+            b4.metric("Rushers", diagnostic.get("actual_rusher_count", "—"))
+            evidence = prediction.get("_temporal_evidence") or {}
+            frames = evidence.get("frames") or []
+            with st.expander("View V3.2 diagnostic frames"):
+                for item in frames:
+                    path = item.get("path")
+                    if path and Path(path).exists():
+                        st.image(
+                            str(path),
+                            caption=(
+                                f"Frame {int(item.get('frame_index', 0)):02d} — "
+                                f"{float(item.get('timestamp_seconds', 0)):.2f}s"
+                            ),
+                            use_container_width=True,
+                        )
+        elif analyzer_version == "v3.1-temporal-frames":
             st.caption(
                 "V3.1 extracts 12 individual high-resolution frames locally and sends them "
                 "to Gemini in chronological order in one request. Python still derives "
@@ -432,7 +467,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v3.1-temporal-frames":
+    if analyzer_version == "v3.2-temporal-diagnostic":
+        st.info(
+            "V3.2 is intentionally narrow: one Gemini request over 12 individual high-resolution "
+            "frames, returning only snap timing, formation family, RB start/end side, box counts, "
+            "and actual rusher count. Use this before any full 9-play batch."
+        )
+    elif analyzer_version == "v3.1-temporal-frames":
         st.info(
             "V3.1 performs FFmpeg frame extraction locally, sends 12 individual high-resolution "
             "frames in chronological order, and makes only 1 Gemini image-analysis request per snap. "
@@ -537,7 +578,7 @@ def _render_batch(
             if position < len(eligible):
                 if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
                     time.sleep(8)
-                elif analyzer_version in {"v3.1-temporal-frames", "v3-temporal-evidence"}:
+                elif analyzer_version in {"v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence"}:
                     time.sleep(6)
                 else:
                     time.sleep(6)
@@ -572,7 +613,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -612,8 +653,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V3.1 turns each clip into 12 high-resolution chronological frames locally, sends one "
-        "Gemini image-analysis request, and derives football labels with deterministic rules."
+        "V3.2 is a narrow diagnostic over 12 high-resolution chronological frames. It tests "
+        "whether Flash-Lite can recover temporal football evidence before we add full charting back."
     )
 
     chart = load_film_chart()
@@ -636,7 +677,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V3.1 for the high-resolution temporal-frame benchmark. Older analyzers remain available as baselines.",
+        help="Use V3.2 first to validate the temporal still-frame approach. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
