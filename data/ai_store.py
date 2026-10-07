@@ -25,6 +25,8 @@ def save_ai_prediction(
     prediction: dict,
     score_matches: int | None = None,
     score_total: int | None = None,
+    video_fps: float | None = None,
+    use_play_text: bool | None = None,
     path: str | Path = DEFAULT_AI_PREDICTIONS,
 ) -> Path:
     target = Path(path)
@@ -35,6 +37,8 @@ def save_ai_prediction(
         "play_id": str(play_id),
         "model": model,
         "chart_side": chart_side,
+        "video_fps": video_fps,
+        "use_play_text": use_play_text,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "overall_confidence": prediction.get("overall_confidence"),
         "score_matches": score_matches,
@@ -45,11 +49,14 @@ def save_ai_prediction(
     existing = load_ai_predictions(target)
     new_row = pd.DataFrame([record])
 
-    if not existing.empty and {"game_id", "play_id", "model"}.issubset(existing.columns):
+    key_columns = {"game_id", "play_id", "model", "video_fps", "use_play_text"}
+    if not existing.empty and key_columns.issubset(existing.columns):
         keep = ~(
             existing["game_id"].astype(str).eq(str(game_id))
             & existing["play_id"].astype(str).eq(str(play_id))
             & existing["model"].astype(str).eq(str(model))
+            & pd.to_numeric(existing["video_fps"], errors="coerce").eq(video_fps)
+            & existing["use_play_text"].astype(str).str.lower().eq(str(use_play_text).lower())
         )
         existing = existing.loc[keep]
 
