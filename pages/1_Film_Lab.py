@@ -221,12 +221,72 @@ def main():
 
     with left:
         st.markdown("#### Offense")
-        personnel = st.selectbox("Personnel", ["", "10", "11", "12", "13", "20", "21", "22", "Empty", "Other"])
-        formation_family = st.selectbox("Formation family", ["", "Gun", "Pistol", "Under Center", "Goalline", "Other"])
-        formation = st.text_input("Formation")
-        formation_strength = st.selectbox("Formation strength", ["", "Left", "Right", "Balanced", "Boundary", "Field", "Unknown"])
-        motion = st.text_input("Motion")
-        shift = st.text_input("Shift")
+        personnel = st.selectbox(
+            "Personnel",
+            ["", "10", "11", "12", "13", "20", "21", "22", "Other"],
+            help=(
+                "Personnel describes who is on the field, not where they align. "
+                "If a RB motions out to WR, the personnel grouping does not change."
+            ),
+        )
+        formation_family = st.selectbox(
+            "Formation family",
+            ["", "Gun", "Pistol", "Under Center", "Goalline", "Other"],
+        )
+
+        st.markdown("##### Formation evolution")
+        initial_formation = st.text_input(
+            "Initial formation",
+            placeholder="Example: 2x2 with two backs",
+            help="Alignment before any motion or shift.",
+        )
+        initial_backfield = st.text_input(
+            "Initial backfield alignment",
+            placeholder="Example: split backs / RB left + RB right",
+        )
+        final_formation = st.text_input(
+            "Formation at snap",
+            placeholder="Example: 3x1 trips",
+            help="The final offensive alignment when the ball is snapped.",
+        )
+        final_backfield = st.text_input(
+            "Backfield at snap",
+            placeholder="Example: empty / RB left / RB right / pistol dot",
+        )
+        formation_strength = st.selectbox(
+            "Formation strength at snap",
+            ["", "Left", "Right", "Balanced", "Boundary", "Field", "Unknown"],
+        )
+
+        st.markdown("##### Motion / shift")
+        motion_present = st.selectbox("Motion?", ["No", "Yes", "Unknown"])
+        motion_player = st.text_input(
+            "Motion player",
+            placeholder="Example: RB #5 / Y / slot WR",
+        )
+        motion_type = st.selectbox(
+            "Motion type",
+            ["", "Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other"],
+        )
+        motion_direction = st.text_input(
+            "Motion direction",
+            placeholder="Example: left-to-right / field-to-boundary",
+        )
+        motion_start_alignment = st.text_input(
+            "Motion start alignment",
+            placeholder="Example: RB in backfield",
+        )
+        motion_end_alignment = st.text_input(
+            "Motion end alignment",
+            placeholder="Example: No. 3 receiver in trips",
+        )
+
+        shift_present = st.selectbox("Shift?", ["No", "Yes", "Unknown"])
+        shift_description = st.text_input(
+            "Shift description",
+            placeholder="Example: 2x2 to 3x1, multiple players reset",
+        )
+
         play_type = st.selectbox("Film play type", ["", "Run", "Pass", "RPO", "Scramble", "Sack", "Other"])
         run_concept = st.text_input("Run concept")
         run_direction = st.selectbox("Run direction", ["", "Left", "Right", "Middle", "Boundary", "Field", "Unknown"])
@@ -238,13 +298,40 @@ def main():
         st.markdown("#### Defense")
         defensive_personnel = st.text_input("Defensive personnel", placeholder="4-2-5")
         front = st.text_input("Front", placeholder="Even / Odd / Mint / Bear")
-        box_count = st.number_input("Box count", min_value=0, max_value=11, value=6, step=1)
+        pre_motion_box_count = st.number_input(
+            "Box count before motion",
+            min_value=0,
+            max_value=11,
+            value=6,
+            step=1,
+        )
+        post_motion_box_count = st.number_input(
+            "Box count at snap",
+            min_value=0,
+            max_value=11,
+            value=6,
+            step=1,
+        )
         shell = st.selectbox("Shell", ["", "1-High", "2-High", "0-High", "Unknown"])
         coverage = st.text_input("Coverage", placeholder="Cover 1 / 3 / 4 / 6 / Match / Unknown")
         rushers = st.number_input("Rushers", min_value=0, max_value=11, value=4, step=1)
         blitz = st.selectbox("Blitz?", ["Unknown", "No", "Yes"])
         pressure_type = st.text_input("Pressure type", placeholder="LB / DB / Sim / Zero / Other")
-        motion_response = st.text_input("Motion response")
+
+        st.markdown("##### Defensive response to motion")
+        motion_response_type = st.selectbox(
+            "Response type",
+            ["", "None", "Bump", "Travel", "Safety rotation", "Front adjustment", "Box adjustment", "Other", "Unknown"],
+        )
+        motion_response_player = st.text_input(
+            "Defender responding",
+            placeholder="Example: Will LB / nickel / safety",
+        )
+        motion_response = st.text_input(
+            "Response detail",
+            placeholder="Example: Will bumps outside box with motion",
+        )
+
         playbook_match = st.text_input("CFB 27 playbook match")
         match_confidence = st.slider("Playbook match confidence", 0, 100, 0, 5)
         notes = st.text_area("Notes")
@@ -276,10 +363,22 @@ def main():
             "video_end_seconds": end_seconds,
             "personnel": personnel or None,
             "formation_family": formation_family or None,
-            "formation": formation or None,
+            "initial_formation": initial_formation or None,
+            "initial_backfield": initial_backfield or None,
+            "formation": final_formation or None,
+            "final_formation": final_formation or None,
+            "final_backfield": final_backfield or None,
             "formation_strength": formation_strength or None,
-            "motion": motion or None,
-            "shift": shift or None,
+            "motion_present": None if motion_present == "Unknown" else motion_present == "Yes",
+            "motion_player": motion_player or None,
+            "motion_type": motion_type or None,
+            "motion_direction": motion_direction or None,
+            "motion_start_alignment": motion_start_alignment or None,
+            "motion_end_alignment": motion_end_alignment or None,
+            "motion": motion_type or None,
+            "shift_present": None if shift_present == "Unknown" else shift_present == "Yes",
+            "shift_description": shift_description or None,
+            "shift": shift_description or None,
             "film_play_type": play_type or None,
             "run_concept": run_concept or None,
             "run_direction": run_direction or None,
@@ -288,12 +387,16 @@ def main():
             "play_action": None if play_action == "Unknown" else play_action == "Yes",
             "defensive_personnel": defensive_personnel or None,
             "front": front or None,
-            "box_count": int(box_count),
+            "pre_motion_box_count": int(pre_motion_box_count),
+            "post_motion_box_count": int(post_motion_box_count),
+            "box_count": int(post_motion_box_count),
             "shell": shell or None,
             "coverage": coverage or None,
             "rushers": int(rushers),
             "blitz": None if blitz == "Unknown" else blitz == "Yes",
             "pressure_type": pressure_type or None,
+            "motion_response_type": motion_response_type or None,
+            "motion_response_player": motion_response_player or None,
             "motion_response": motion_response or None,
             "playbook_match": playbook_match or None,
             "match_confidence": match_confidence / 100 if match_confidence else None,
