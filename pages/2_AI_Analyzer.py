@@ -8,7 +8,7 @@ import streamlit as st
 from analytics.benchmark import compare_prediction, score_prediction
 from data.ai_store import save_ai_prediction
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_openai
+from video.analyze import analyze_clip_gemini
 
 
 def _secret(name: str, default=None):
@@ -54,8 +54,8 @@ def main():
     st.set_page_config(page_title="AI Analyzer", layout="wide")
     st.title("AI Analyzer v1")
     st.caption(
-        "Have a multimodal model chart one extracted snap, then compare its "
-        "structured answer against your validated Film Lab chart."
+        "Upload one extracted snap directly to Google Gemini for native video "
+        "analysis, then compare its structured chart against your validated Film Lab data."
     )
 
     chart = load_film_chart()
@@ -106,20 +106,23 @@ def main():
         horizontal=True,
     )
 
-    api_key = _secret("OPENAI_API_KEY")
-    model_default = _secret("OPENAI_MODEL", "gpt-6-luna")
+    api_key = _secret("GEMINI_API_KEY")
+    model_default = _secret("GEMINI_MODEL", "gemini-3.1-flash-lite")
     model = st.text_input(
-        "AI model",
+        "Gemini model",
         value=str(model_default),
-        help="Stored locally in Streamlit secrets if you set OPENAI_MODEL.",
+        help="For the cost-efficient baseline, use gemini-3.1-flash-lite.",
     )
-    frame_count = st.slider(
-        "Frames sampled from the snap",
-        min_value=6,
-        max_value=12,
-        value=8,
-        step=1,
-        help="More frames give more temporal information but use more image input.",
+    video_fps = st.slider(
+        "Video sampling FPS",
+        min_value=1.0,
+        max_value=5.0,
+        value=3.0,
+        step=0.5,
+        help=(
+            "Football has fast pre/post-snap movement. Start at 3 FPS; increase "
+            "only if the benchmark shows the model is missing motion or concepts."
+        ),
     )
     use_play_text = st.checkbox(
         "Give the model CFBD play-by-play context",
@@ -132,7 +135,7 @@ def main():
 
     if not api_key:
         st.warning(
-            "OPENAI_API_KEY is not configured. Add it to .streamlit/secrets.toml "
+            "GEMINI_API_KEY is not configured. Add it to .streamlit/secrets.toml "
             "before running the analyzer. Do not paste the key into chat."
         )
 
@@ -142,7 +145,7 @@ def main():
         disabled=(not bool(api_key) or not clip_path.exists()),
     )
 
-    result_key = f"ai_result_{human.get('game_id')}_{human.get('play_id')}_{model}"
+    result_key = f"ai_result_{human.get('game_id')}_{human.get('play_id')}_{model}_{video_fps}"
     if analyze_clicked:
         play_context = {
             "team": _clean(human.get("team"), ""),
@@ -155,14 +158,14 @@ def main():
         }
         try:
             with st.spinner(
-                f"Sampling {frame_count} frames and asking {model} to chart the snap..."
+                f"Uploading the snap and asking {model} to analyze the video at {video_fps:.1f} FPS..."
             ):
-                prediction = analyze_clip_openai(
+                prediction = analyze_clip_gemini(
                     clip_path=clip_path,
                     play_context=play_context,
                     api_key=api_key,
                     model=model.strip(),
-                    frame_count=int(frame_count),
+                    fps=float(video_fps),
                 )
             st.session_state[result_key] = prediction
         except Exception as exc:
