@@ -62,6 +62,68 @@ def _play_label(row: pd.Series, idx: int) -> str:
     return f"{idx + 1}. Q{period} {clock} | {down} & {distance} | {play_type} | {text}"
 
 
+def _saved_observation(game_id: str, play_id: str) -> dict:
+    """Return the saved chart row for a play, if one exists."""
+    chart = load_film_chart()
+    if chart.empty or not {"game_id", "play_id"}.issubset(chart.columns):
+        return {}
+
+    matches = chart[
+        chart["game_id"].astype(str).eq(str(game_id))
+        & chart["play_id"].astype(str).eq(str(play_id))
+    ]
+    if matches.empty:
+        return {}
+
+    row = matches.iloc[-1].to_dict()
+    return {
+        key: value
+        for key, value in row.items()
+        if not (isinstance(value, float) and pd.isna(value))
+    }
+
+
+def _saved_text(saved: dict, key: str, default: str = "") -> str:
+    value = saved.get(key, default)
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    return str(value)
+
+
+def _saved_int(saved: dict, key: str, default: int) -> int:
+    value = saved.get(key, default)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _saved_yes_no(saved: dict, key: str, default: str = "Unknown") -> str:
+    value = saved.get(key)
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return "Yes"
+        if normalized in {"false", "no", "0"}:
+            return "No"
+        return default
+    return "Yes" if bool(value) else "No"
+
+
+def _options_with_saved(options: list[str], saved_value) -> tuple[list[str], int]:
+    value = "" if saved_value is None else str(saved_value)
+    choices = list(options)
+    if value and value not in choices:
+        choices.append(value)
+    try:
+        index = choices.index(value)
+    except ValueError:
+        index = 0
+    return choices, index
+
+
 def main():
     st.set_page_config(page_title="Film Lab", layout="wide")
     st.title("Film Lab")
@@ -219,6 +281,11 @@ def main():
         )
         play = filtered.iloc[selected_idx]
 
+    play_id = _safe_text(play, "id", "playId", default=f"row-{selected_idx}")
+    game_id = _safe_text(play, "gameId", "game_id", default="unknown-game")
+    saved = _saved_observation(game_id, play_id)
+    widget_prefix = f"{game_id}_{play_id}".replace(" ", "_").replace("/", "-")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Quarter", _safe_text(play, "period", default="?"))
     c2.metric("Clock", _safe_text(play, "clock", default="?"))
@@ -241,20 +308,32 @@ def main():
                 "and extension such as .mp4, .mkv, or .mov."
             )
 
+    saved_start = saved.get("video_start_seconds")
+    saved_end = saved.get("video_end_seconds")
+    start_default = (
+        format_timecode(float(saved_start))
+        if saved_start is not None and not pd.isna(saved_start)
+        else ""
+    )
+    end_default = (
+        format_timecode(float(saved_end))
+        if saved_end is not None and not pd.isna(saved_end)
+        else ""
+    )
+
     t1, t2 = st.columns(2)
     start_text = t1.text_input(
         "Clip start",
-        value="0:00",
+        value=start_default,
+        key=f"clip_start_{widget_prefix}",
         help="Enter SS, MM:SS, or HH:MM:SS from the downloaded broadcast.",
     )
     end_text = t2.text_input(
         "Clip end",
-        value="0:20",
+        value=end_default,
+        key=f"clip_end_{widget_prefix}",
         help="Usually 10-25 seconds is enough for a snap.",
     )
-
-    play_id = _safe_text(play, "id", "playId", default=f"row-{selected_idx}")
-    game_id = _safe_text(play, "gameId", "game_id", default="unknown-game")
 
     clip_name = f"{game_id}_{play_id}".replace("/", "-").replace(" ", "_") + ".mp4"
     clip_path = Path("clips") / clip_name
@@ -293,131 +372,320 @@ def main():
     st.divider()
     st.subheader("2. Chart the snap")
 
-    left, right = st.columns(2)
+    if saved:
+        st.success("This play has already been charted. Saved values are loaded for editing.")
+    else:
+        st.caption("New play: charting fields start clean.")
 
-    with left:
-        st.markdown("#### Offense")
-        personnel = st.selectbox(
-            "Personnel",
-            ["", "10", "11", "12", "13", "20", "21", "22", "Other"],
-            help=(
-                "Personnel describes who is on the field, not where they align. "
-                "If a RB motions out to WR, the personnel grouping does not change."
-            ),
-        )
-        formation_family = st.selectbox(
-            "Formation family",
-            ["", "Gun", "Pistol", "Under Center", "Goalline", "Other"],
-        )
+    personnel_options, personnel_index = _options_with_saved(
+        ["", "10", "11", "12", "13", "20", "21", "22", "Other"],
+        saved.get("personnel"),
+    )
+    family_options, family_index = _options_with_saved(
+        ["", "Gun", "Pistol", "Under Center", "Goalline", "Other"],
+        saved.get("formation_family"),
+    )
+    initial_structure_options, initial_structure_index = _options_with_saved(
+        ["", "2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other"],
+        saved.get("initial_formation"),
+    )
+    final_structure_options, final_structure_index = _options_with_saved(
+        ["", "2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other"],
+        saved.get("final_formation", saved.get("formation")),
+    )
+    initial_backfield_options, initial_backfield_index = _options_with_saved(
+        ["", "Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other"],
+        saved.get("initial_backfield"),
+    )
+    final_backfield_options, final_backfield_index = _options_with_saved(
+        ["", "Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other"],
+        saved.get("final_backfield"),
+    )
+    strength_options, strength_index = _options_with_saved(
+        ["", "Left", "Right", "Balanced", "Boundary", "Field", "Unknown"],
+        saved.get("formation_strength"),
+    )
+    motion_type_options, motion_type_index = _options_with_saved(
+        ["", "Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other"],
+        saved.get("motion_type", saved.get("motion")),
+    )
+    run_direction_options, run_direction_index = _options_with_saved(
+        ["", "Left", "Right", "Middle", "Boundary", "Field", "Unknown"],
+        saved.get("run_direction"),
+    )
+    shell_options, shell_index = _options_with_saved(
+        ["", "1-High", "2-High", "0-High", "Unknown"],
+        saved.get("shell"),
+    )
+    response_options, response_index = _options_with_saved(
+        ["", "None", "Bump", "Travel", "Safety rotation", "Front adjustment", "Box adjustment", "Other", "Unknown"],
+        saved.get("motion_response_type"),
+    )
 
-        st.markdown("##### Formation evolution")
-        initial_formation = st.text_input(
-            "Initial formation",
-            placeholder="Example: 2x2 with two backs",
-            help="Alignment before any motion or shift.",
-        )
-        initial_backfield = st.text_input(
-            "Initial backfield alignment",
-            placeholder="Example: split backs / RB left + RB right",
-        )
-        final_formation = st.text_input(
-            "Formation at snap",
-            placeholder="Example: 3x1 trips",
-            help="The final offensive alignment when the ball is snapped.",
-        )
-        final_backfield = st.text_input(
-            "Backfield at snap",
-            placeholder="Example: empty / RB left / RB right / pistol dot",
-        )
-        formation_strength = st.selectbox(
-            "Formation strength at snap",
-            ["", "Left", "Right", "Balanced", "Boundary", "Field", "Unknown"],
-        )
+    with st.form(key=f"chart_form_{widget_prefix}"):
+        left, right = st.columns(2)
 
-        st.markdown("##### Motion / shift")
-        motion_present = st.selectbox("Motion?", ["No", "Yes", "Unknown"])
-        motion_player = st.text_input(
-            "Motion player",
-            placeholder="Example: RB #5 / Y / slot WR",
-        )
-        motion_type = st.selectbox(
-            "Motion type",
-            ["", "Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other"],
-        )
-        motion_direction = st.text_input(
-            "Motion direction",
-            placeholder="Example: left-to-right / field-to-boundary",
-        )
-        motion_start_alignment = st.text_input(
-            "Motion start alignment",
-            placeholder="Example: RB in backfield",
-        )
-        motion_end_alignment = st.text_input(
-            "Motion end alignment",
-            placeholder="Example: No. 3 receiver in trips",
-        )
+        with left:
+            st.markdown("#### Offense")
+            personnel = st.selectbox(
+                "Personnel",
+                personnel_options,
+                index=personnel_index,
+                help=(
+                    "Personnel describes who is on the field, not where they align. "
+                    "If a RB motions out to WR, the personnel grouping does not change."
+                ),
+            )
+            formation_family = st.selectbox(
+                "Formation family",
+                family_options,
+                index=family_index,
+            )
 
-        shift_present = st.selectbox("Shift?", ["No", "Yes", "Unknown"])
-        shift_description = st.text_input(
-            "Shift description",
-            placeholder="Example: 2x2 to 3x1, multiple players reset",
-        )
+            st.markdown("##### Formation evolution")
+            initial_formation = st.selectbox(
+                "Initial receiver structure",
+                initial_structure_options,
+                index=initial_structure_index,
+                help="Receiver distribution before motion or shift.",
+            )
+            initial_formation_detail = st.text_input(
+                "Initial formation detail",
+                value=_saved_text(saved, "initial_formation_detail"),
+                placeholder="Optional detail: nub, TE attached, condensed, etc.",
+            )
+            initial_backfield = st.selectbox(
+                "Initial backfield alignment",
+                initial_backfield_options,
+                index=initial_backfield_index,
+            )
+            final_formation = st.selectbox(
+                "Receiver structure at snap",
+                final_structure_options,
+                index=final_structure_index,
+            )
+            final_formation_detail = st.text_input(
+                "Formation detail at snap",
+                value=_saved_text(saved, "final_formation_detail"),
+                placeholder="Optional detail: trips boundary, nub TE, condensed, etc.",
+            )
+            final_backfield = st.selectbox(
+                "Backfield at snap",
+                final_backfield_options,
+                index=final_backfield_index,
+            )
+            formation_strength = st.selectbox(
+                "Formation strength at snap",
+                strength_options,
+                index=strength_index,
+            )
 
-        play_type = st.selectbox("Film play type", ["", "Run", "Pass", "RPO", "Scramble", "Sack", "Other"])
-        run_concept = st.text_input("Run concept")
-        run_direction = st.selectbox("Run direction", ["", "Left", "Right", "Middle", "Boundary", "Field", "Unknown"])
-        pass_concept = st.text_input("Pass concept")
-        rpo = st.selectbox("RPO?", ["Unknown", "No", "Yes"])
-        play_action = st.selectbox("Play action?", ["Unknown", "No", "Yes"])
+            st.markdown("##### Motion / shift")
+            motion_present = st.selectbox(
+                "Motion?",
+                ["No", "Yes", "Unknown"],
+                index=["No", "Yes", "Unknown"].index(_saved_yes_no(saved, "motion_present", "No")),
+            )
+            motion_player = st.text_input(
+                "Motion player",
+                value=_saved_text(saved, "motion_player"),
+                placeholder="Example: RB #5 / Y / slot WR",
+            )
+            motion_type = st.selectbox(
+                "Motion type",
+                motion_type_options,
+                index=motion_type_index,
+            )
+            motion_direction = st.text_input(
+                "Motion direction",
+                value=_saved_text(saved, "motion_direction"),
+                placeholder="Example: left-to-right / field-to-boundary",
+            )
+            motion_start_alignment = st.text_input(
+                "Motion start alignment",
+                value=_saved_text(saved, "motion_start_alignment"),
+                placeholder="Example: RB in backfield",
+            )
+            motion_end_alignment = st.text_input(
+                "Motion end alignment",
+                value=_saved_text(saved, "motion_end_alignment"),
+                placeholder="Example: No. 3 receiver in trips",
+            )
 
-    with right:
-        st.markdown("#### Defense")
-        defensive_personnel = st.text_input("Defensive personnel", placeholder="4-2-5")
-        front = st.text_input("Front", placeholder="Even / Odd / Mint / Bear")
-        pre_motion_box_count = st.number_input(
-            "Box count before motion",
-            min_value=0,
-            max_value=11,
-            value=6,
-            step=1,
-        )
-        post_motion_box_count = st.number_input(
-            "Box count at snap",
-            min_value=0,
-            max_value=11,
-            value=6,
-            step=1,
-        )
-        shell = st.selectbox("Shell", ["", "1-High", "2-High", "0-High", "Unknown"])
-        coverage = st.text_input("Coverage", placeholder="Cover 1 / 3 / 4 / 6 / Match / Unknown")
-        rushers = st.number_input("Rushers", min_value=0, max_value=11, value=4, step=1)
-        blitz = st.selectbox("Blitz?", ["Unknown", "No", "Yes"])
-        pressure_type = st.text_input("Pressure type", placeholder="LB / DB / Sim / Zero / Other")
+            shift_present = st.selectbox(
+                "Shift?",
+                ["No", "Yes", "Unknown"],
+                index=["No", "Yes", "Unknown"].index(_saved_yes_no(saved, "shift_present", "No")),
+            )
+            shift_description = st.text_input(
+                "Shift description",
+                value=_saved_text(saved, "shift_description", _saved_text(saved, "shift")),
+                placeholder="Example: 2x2 to 3x1, multiple players reset",
+            )
 
-        st.markdown("##### Defensive response to motion")
-        motion_response_type = st.selectbox(
-            "Response type",
-            ["", "None", "Bump", "Travel", "Safety rotation", "Front adjustment", "Box adjustment", "Other", "Unknown"],
-        )
-        motion_response_player = st.text_input(
-            "Defender responding",
-            placeholder="Example: Will LB / nickel / safety",
-        )
-        motion_response = st.text_input(
-            "Response detail",
-            placeholder="Example: Will bumps outside box with motion",
-        )
+            play_type_options, play_type_index = _options_with_saved(
+                ["", "Run", "Pass", "RPO", "Scramble", "Sack", "Other"],
+                saved.get("film_play_type"),
+            )
+            play_type = st.selectbox(
+                "Film play type",
+                play_type_options,
+                index=play_type_index,
+            )
+            run_concept = st.text_input(
+                "Run concept",
+                value=_saved_text(saved, "run_concept"),
+            )
+            run_direction = st.selectbox(
+                "Run direction",
+                run_direction_options,
+                index=run_direction_index,
+            )
+            pass_concept = st.text_input(
+                "Pass concept",
+                value=_saved_text(saved, "pass_concept"),
+            )
+            rpo = st.selectbox(
+                "RPO?",
+                ["Unknown", "No", "Yes"],
+                index=["Unknown", "No", "Yes"].index(_saved_yes_no(saved, "rpo")),
+            )
+            play_action = st.selectbox(
+                "Play action?",
+                ["Unknown", "No", "Yes"],
+                index=["Unknown", "No", "Yes"].index(_saved_yes_no(saved, "play_action")),
+            )
 
-        playbook_match = st.text_input("CFB 27 playbook match")
-        match_confidence = st.slider("Playbook match confidence", 0, 100, 0, 5)
-        notes = st.text_area("Notes")
+        with right:
+            st.markdown("#### Defense")
+            defensive_personnel = st.text_input(
+                "Defensive personnel",
+                value=_saved_text(saved, "defensive_personnel"),
+                placeholder="4-2-5",
+            )
+            front = st.text_input(
+                "Front",
+                value=_saved_text(saved, "front"),
+                placeholder="Even / Odd / Mint / Bear",
+            )
+            initial_box_count = st.number_input(
+                "Initial box count",
+                min_value=0,
+                max_value=11,
+                value=_saved_int(saved, "pre_motion_box_count", 6),
+                step=1,
+                help="Count before any offensive motion or defensive adjustment.",
+            )
+            snap_box_count = st.number_input(
+                "Box count at snap",
+                min_value=0,
+                max_value=11,
+                value=_saved_int(saved, "post_motion_box_count", _saved_int(saved, "box_count", 6)),
+                step=1,
+            )
+            shell = st.selectbox(
+                "Shell",
+                shell_options,
+                index=shell_index,
+            )
+            coverage = st.text_input(
+                "Coverage",
+                value=_saved_text(saved, "coverage"),
+                placeholder="Cover 1 / 3 / 4 / 6 / Match / Unknown",
+            )
+            rushers = st.number_input(
+                "Rushers",
+                min_value=0,
+                max_value=11,
+                value=_saved_int(saved, "rushers", 4),
+                step=1,
+            )
+            blitz = st.selectbox(
+                "Blitz?",
+                ["Unknown", "No", "Yes"],
+                index=["Unknown", "No", "Yes"].index(_saved_yes_no(saved, "blitz")),
+            )
+            pressure_type = st.text_input(
+                "Pressure type",
+                value=_saved_text(saved, "pressure_type"),
+                placeholder="LB / DB / Sim / Zero / Other",
+            )
 
-    reviewed = st.checkbox("Reviewed / validated", value=True)
+            st.markdown("##### Defensive response to motion")
+            motion_response_type = st.selectbox(
+                "Response type",
+                response_options,
+                index=response_index,
+            )
+            motion_response_player = st.text_input(
+                "Defender responding",
+                value=_saved_text(saved, "motion_response_player"),
+                placeholder="Example: Will LB / nickel / safety",
+            )
+            motion_response = st.text_input(
+                "Response detail",
+                value=_saved_text(saved, "motion_response"),
+                placeholder="Example: Will bumps outside box with RB motion",
+            )
 
-    if st.button("Save film chart"):
+            playbook_match = st.text_input(
+                "CFB 27 playbook match",
+                value=_saved_text(saved, "playbook_match"),
+            )
+            saved_confidence = saved.get("match_confidence")
+            try:
+                saved_confidence_pct = int(round(float(saved_confidence) * 100))
+            except (TypeError, ValueError):
+                saved_confidence_pct = 0
+            match_confidence = st.slider(
+                "Playbook match confidence",
+                0,
+                100,
+                saved_confidence_pct,
+                5,
+            )
+            notes = st.text_area(
+                "Notes",
+                value=_saved_text(saved, "notes"),
+            )
+
+        reviewed_default = _saved_yes_no(saved, "reviewed", "Yes") == "Yes"
+        reviewed = st.checkbox("Reviewed / validated", value=reviewed_default)
+
+        qc_warnings = []
+        motion_details = [
+            motion_player,
+            motion_type,
+            motion_direction,
+            motion_start_alignment,
+            motion_end_alignment,
+        ]
+        if motion_present == "No" and any(str(value).strip() for value in motion_details):
+            qc_warnings.append("Motion is marked No, but motion detail fields are populated.")
+        if shift_present == "No" and shift_description.strip():
+            qc_warnings.append("Shift is marked No, but a shift description is populated.")
+        if play_type == "Run" and pass_concept.strip():
+            qc_warnings.append("Play type is Run, but Pass concept is populated.")
+        if play_type == "Pass" and (run_concept.strip() or run_direction):
+            qc_warnings.append("Play type is Pass, but Run concept/direction is populated.")
+        if motion_present == "No" and (
+            motion_response_type not in {"", "None", "Unknown"}
+            or motion_response_player.strip()
+            or motion_response.strip()
+        ):
+            qc_warnings.append(
+                "Motion is marked No, but defensive response-to-motion fields are populated."
+            )
+
+        if qc_warnings:
+            st.warning("QC check:\n\n- " + "\n- ".join(qc_warnings))
+
+        save_clicked = st.form_submit_button("Save film chart", type="primary")
+
+    if save_clicked:
         try:
-            start_seconds = parse_timecode(start_text)
-            end_seconds = parse_timecode(end_text)
+            start_seconds = parse_timecode(start_text) if start_text.strip() else None
+            end_seconds = parse_timecode(end_text) if end_text.strip() else None
         except Exception:
             start_seconds = None
             end_seconds = None
@@ -440,9 +708,11 @@ def main():
             "personnel": personnel or None,
             "formation_family": formation_family or None,
             "initial_formation": initial_formation or None,
+            "initial_formation_detail": initial_formation_detail or None,
             "initial_backfield": initial_backfield or None,
             "formation": final_formation or None,
             "final_formation": final_formation or None,
+            "final_formation_detail": final_formation_detail or None,
             "final_backfield": final_backfield or None,
             "formation_strength": formation_strength or None,
             "motion_present": None if motion_present == "Unknown" else motion_present == "Yes",
@@ -463,9 +733,9 @@ def main():
             "play_action": None if play_action == "Unknown" else play_action == "Yes",
             "defensive_personnel": defensive_personnel or None,
             "front": front or None,
-            "pre_motion_box_count": int(pre_motion_box_count),
-            "post_motion_box_count": int(post_motion_box_count),
-            "box_count": int(post_motion_box_count),
+            "pre_motion_box_count": int(initial_box_count),
+            "post_motion_box_count": int(snap_box_count),
+            "box_count": int(snap_box_count),
             "shell": shell or None,
             "coverage": coverage or None,
             "rushers": int(rushers),
@@ -477,10 +747,17 @@ def main():
             "playbook_match": playbook_match or None,
             "match_confidence": match_confidence / 100 if match_confidence else None,
             "reviewed": reviewed,
+            "qc_warning_count": len(qc_warnings),
             "notes": notes or None,
         }
         saved_path = save_film_observation(observation)
-        st.success(f"Saved reviewed film data to {saved_path}")
+        if qc_warnings:
+            st.warning(
+                f"Saved with {len(qc_warnings)} QC warning(s) to {saved_path}. "
+                "Review this row before using it as AI ground truth."
+            )
+        else:
+            st.success(f"Saved reviewed film data to {saved_path}")
 
     st.divider()
     st.subheader("3. Reviewed chart")
