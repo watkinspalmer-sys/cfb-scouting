@@ -49,7 +49,17 @@ class FilmObservation:
     coverage: Optional[str] = None
     rushers: Optional[int] = None
     blitz: Optional[bool] = None
+    pressure_family: Optional[str] = None
+    pressure_source: Optional[str] = None
     pressure_type: Optional[str] = None
+
+    # Defensive pre-snap movement / response.
+    adjustment_trigger: Optional[str] = None
+    adjustment_type: Optional[str] = None
+    adjustment_player: Optional[str] = None
+    adjustment_detail: Optional[str] = None
+
+    # Backward-compatible aliases retained for existing chart rows.
     motion_response_type: Optional[str] = None
     motion_response_player: Optional[str] = None
     motion_response: Optional[str] = None
