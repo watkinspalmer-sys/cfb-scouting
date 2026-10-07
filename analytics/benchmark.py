@@ -43,6 +43,43 @@ FIELD_MAP = [
 ]
 
 
+FIELD_CATEGORIES = {
+    "Personnel": "Offensive structure",
+    "Formation family": "Offensive structure",
+    "Initial receiver structure": "Offensive structure",
+    "Initial backfield": "Offensive structure",
+    "Receiver structure at snap": "Offensive structure",
+    "Backfield at snap": "Offensive structure",
+    "Formation strength": "Offensive structure",
+    "Motion present": "Pre-snap movement",
+    "Motion player": "Pre-snap movement",
+    "Motion type": "Pre-snap movement",
+    "Motion direction": "Pre-snap movement",
+    "Shift present": "Pre-snap movement",
+    "Shift description": "Pre-snap movement",
+    "Film play type": "Play classification",
+    "Run concept": "Play classification",
+    "Run direction": "Play classification",
+    "Pass concept": "Play classification",
+    "RPO": "Play classification",
+    "Play action": "Play classification",
+    "Defensive personnel": "Defensive structure",
+    "Front": "Defensive structure",
+    "Initial box count": "Defensive structure",
+    "Box count at snap": "Defensive structure",
+    "Shell": "Defensive structure",
+    "Coverage": "Coverage",
+    "Rushers": "Pressure",
+    "Blitz": "Pressure",
+    "Pressure family": "Pressure",
+    "Pressure source": "Pressure",
+    "Adjustment trigger": "Defensive adjustment",
+    "Adjustment type": "Defensive adjustment",
+    "Adjustment player": "Defensive adjustment",
+    "Adjustment detail": "Defensive adjustment",
+}
+
+
 ALIASES = {
     "two high": "2 high",
     "2-high": "2 high",
@@ -111,6 +148,7 @@ def compare_prediction(human: dict, prediction: dict) -> pd.DataFrame:
         rows.append(
             {
                 "Field": label,
+                "Category": FIELD_CATEGORIES.get(label, "Other"),
                 "Human": None if _missing(human_value) else human_value,
                 "AI": None if _missing(ai_value) else ai_value,
                 "Scored": eligible,
@@ -129,3 +167,24 @@ def score_prediction(comparison: pd.DataFrame) -> tuple[int, int, float | None]:
     matches = int(scored["Match"].eq(True).sum())
     total = int(len(scored))
     return matches, total, matches / total
+
+
+def category_summary(comparisons: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate exact-match accuracy by scouting category."""
+    if comparisons.empty:
+        return pd.DataFrame(columns=["Category", "Matches", "Scored fields", "Accuracy"])
+
+    scored = comparisons[comparisons["Scored"].eq(True)].copy()
+    if scored.empty:
+        return pd.DataFrame(columns=["Category", "Matches", "Scored fields", "Accuracy"])
+
+    grouped = (
+        scored.groupby("Category", dropna=False)
+        .agg(
+            Matches=("Match", lambda s: int(s.eq(True).sum())),
+            **{"Scored fields": ("Match", "size")},
+        )
+        .reset_index()
+    )
+    grouped["Accuracy"] = grouped["Matches"] / grouped["Scored fields"]
+    return grouped.sort_values(["Accuracy", "Category"], ascending=[False, True]).reset_index(drop=True)
