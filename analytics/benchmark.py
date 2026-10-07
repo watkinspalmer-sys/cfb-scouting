@@ -102,9 +102,27 @@ def _missing(value) -> bool:
     return text in {"", "nan", "none", "null"}
 
 
-def _normalize(value):
+BOOLEAN_FIELDS = {"Motion present", "Shift present", "RPO", "Play action", "Blitz"}
+
+
+def _normalize(value, field: str | None = None):
     if _missing(value):
         return None
+
+    if field in BOOLEAN_FIELDS:
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if number == 1:
+                return "yes"
+            if number == 0:
+                return "no"
+        text = str(value).strip().lower()
+        if text in {"true", "yes", "1", "1.0"}:
+            return "yes"
+        if text in {"false", "no", "0", "0.0"}:
+            return "no"
 
     if isinstance(value, bool):
         return "yes" if value else "no"
@@ -114,15 +132,33 @@ def _normalize(value):
         return str(int(number)) if number.is_integer() else str(number)
 
     text = str(value).strip().lower()
-    if text in {"true", "yes"}:
-        return "yes"
-    if text in {"false", "no"}:
-        return "no"
-
     text = text.replace("_", " ")
     text = re.sub(r"[^a-z0-9+]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return ALIASES.get(text, text)
+    text = ALIASES.get(text, text)
+
+    if field in {"Initial receiver structure", "Receiver structure at snap"}:
+        for structure in ("2x2", "3x1", "2x1", "3x2", "quads", "unbalanced"):
+            if structure in text:
+                return structure
+
+    if field == "Front":
+        if any(token in text for token in ("4 2", "4 down", "even")):
+            return "even"
+        if any(token in text for token in ("3 3", "3 down", "odd")):
+            return "odd"
+
+    if field in {"Initial backfield", "Backfield at snap"}:
+        if "back to the right" in text or text == "rb right":
+            return "rb right"
+        if "back to the left" in text or text == "rb left":
+            return "rb left"
+        if "split backs" in text:
+            return "split backs"
+        if text in {"pistol", "pistol dot"}:
+            return "pistol dot"
+
+    return text
 
 
 def compare_prediction(human: dict, prediction: dict) -> pd.DataFrame:
@@ -143,7 +179,7 @@ def compare_prediction(human: dict, prediction: dict) -> pd.DataFrame:
         eligible = scored and not _missing(human_value)
         match = None
         if eligible:
-            match = _normalize(human_value) == _normalize(ai_value)
+            match = _normalize(human_value, label) == _normalize(ai_value, label)
 
         rows.append(
             {
