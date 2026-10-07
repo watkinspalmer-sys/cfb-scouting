@@ -65,15 +65,31 @@ class FootballSnapChart(BaseModel):
     analysis_notes: str = ""
 
 
+def _json_safe(value):
+    """Convert pandas/numpy scalar values into normal JSON-safe Python values."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
 def _prompt(play_context: dict) -> str:
     context = {
-        "chart_team": play_context.get("team"),
-        "chart_team_role": play_context.get("chart_side"),
-        "quarter": play_context.get("period"),
-        "game_clock": play_context.get("clock"),
-        "down": play_context.get("down"),
-        "distance": play_context.get("distance"),
-        "play_text": play_context.get("play_text"),
+        "chart_team": _json_safe(play_context.get("team")),
+        "chart_team_role": _json_safe(play_context.get("chart_side")),
+        "quarter": _json_safe(play_context.get("period")),
+        "game_clock": _json_safe(play_context.get("clock")),
+        "down": _json_safe(play_context.get("down")),
+        "distance": _json_safe(play_context.get("distance")),
+        "play_text": _json_safe(play_context.get("play_text")),
     }
 
     return f"""
