@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, score_pred
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21
 
 
 ANALYZERS = {
-    "V2 specialized 3-pass (recommended)": ("v2-specialized", analyze_clip_gemini_v2),
+    "V2.1 mechanical 3-pass (recommended)": ("v2.1-mechanical", analyze_clip_gemini_v21),
+    "V2 specialized 3-pass": ("v2-specialized", analyze_clip_gemini_v2),
     "V1 single-pass baseline": ("v1-single-pass", analyze_clip_gemini),
 }
 
@@ -222,7 +223,7 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            passes = "three specialized passes" if analyzer_version == "v2-specialized" else "one pass"
+            passes = "three specialized passes" if analyzer_version in {"v2-specialized", "v2.1-mechanical"} else "one pass"
             with st.spinner(f"Analyzing with {passes} using {model} at {video_fps:.1f} FPS..."):
                 prediction = _run_analyzer(
                     analyzer_fn, clip_path, human, role.lower(), use_play_text,
@@ -255,18 +256,42 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version == "v2-specialized":
+    if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Observed RBs", derived.get("rb_count", "—"))
+        observed_backs = derived.get("back_count", derived.get("rb_count", "—"))
+        d1.metric("Observed backs", observed_backs)
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        st.caption(
-            "V2 derives personnel from RB/TE counts and blitz from actual rusher count "
-            "instead of asking the model to guess the shorthand."
-        )
+        if analyzer_version == "v2.1-mechanical":
+            st.caption(
+                "V2.1 derives personnel from five eligible-player buckets, derives backfield "
+                "alignment from explicit RB-side tracking, adds two defensive box layers, and "
+                "derives blitz from immediate + delayed actual rushers."
+            )
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("RB start side", derived.get("rb_initial_side", "—"))
+            x2.metric("RB final side", derived.get("rb_final_side", "—"))
+            x3.metric("Immediate rushers", derived.get("immediate_rushers_count", "—"))
+            x4.metric("Delayed rushers", derived.get("delayed_rushers_count", "—"))
+            st.write(
+                "**Eligible-player count:**",
+                {
+                    "backs": derived.get("back_count"),
+                    "attached TE": derived.get("attached_te_count"),
+                    "wing/H": derived.get("wing_hback_count"),
+                    "flexed TE": derived.get("flexed_te_count"),
+                    "WR": derived.get("split_wr_count"),
+                    "total": derived.get("eligible_total"),
+                },
+            )
+        else:
+            st.caption(
+                "V2 derives personnel from RB/TE counts and blitz from actual rusher count "
+                "instead of asking the model to guess the shorthand."
+            )
         if pass_conf:
             st.write("**Pass confidence:**", pass_conf)
 
@@ -356,11 +381,12 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v2-specialized":
+    if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
+        version_name = "V2.1" if analyzer_version == "v2.1-mechanical" else "V2"
         st.info(
-            "V2 uploads each clip once, then makes 3 Gemini analysis calls against that upload: "
-            "structure, movement, and post-snap. This uses more free-tier requests than V1, "
-            "but stays on the same Flash-Lite model."
+            f"{version_name} uploads each clip once, then makes 3 Gemini analysis calls against "
+            "that upload: structure, movement, and post-snap. This uses more free-tier requests "
+            "than V1, but stays on the same Flash-Lite model."
         )
 
     if missing_clips:
@@ -446,7 +472,7 @@ def _render_batch(
 
             progress.progress(position / len(eligible), text=f"Completed {position}/{len(eligible)}")
             if position < len(eligible):
-                time.sleep(8 if analyzer_version == "v2-specialized" else 6)
+                time.sleep(8 if analyzer_version in {"v2-specialized", "v2.1-mechanical"} else 6)
 
         detail = pd.concat(comparisons, ignore_index=True) if comparisons else pd.DataFrame()
         st.session_state[batch_key] = {
@@ -478,15 +504,15 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version == "v2-specialized" and baseline is not None and overall_accuracy is not None:
-        st.subheader("V1 vs V2")
+    if analyzer_version in {"v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+        st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "Stored V1 baseline",
             f"{baseline['accuracy']:.0%}",
             help=f"{baseline['matches']}/{baseline['total']} across {baseline['plays']} stored plays",
         )
-        c2.metric("V2 specialized", f"{overall_accuracy:.0%}")
+        c2.metric(analyzer_version, f"{overall_accuracy:.0%}")
         c3.metric("Change", f"{overall_accuracy - baseline['accuracy']:+.1%}")
 
     table = summary.copy()
@@ -518,8 +544,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V2 separates structure, movement, and post-snap recognition, then derives "
-        "football shorthand with deterministic rules."
+        "V2.1 separates structure, movement, and post-snap recognition, then derives "
+        "personnel, backfield changes, box totals, and blitz with deterministic rules."
     )
 
     chart = load_film_chart()
@@ -542,7 +568,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V2 for the new specialized benchmark. V1 remains available as the baseline.",
+        help="Use V2.1 for the mechanical benchmark. V2 and V1 remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
