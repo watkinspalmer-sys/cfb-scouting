@@ -224,3 +224,29 @@ def category_summary(comparisons: pd.DataFrame) -> pd.DataFrame:
     )
     grouped["Accuracy"] = grouped["Matches"] / grouped["Scored fields"]
     return grouped.sort_values(["Accuracy", "Category"], ascending=[False, True]).reset_index(drop=True)
+
+
+def field_summary(comparisons: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate exact-match accuracy by individual scored benchmark field."""
+    columns = ["Field", "Category", "Matches", "Scored plays", "Accuracy"]
+    if comparisons.empty:
+        return pd.DataFrame(columns=columns)
+
+    scored = comparisons[comparisons["Scored"].eq(True)].copy()
+    if scored.empty:
+        return pd.DataFrame(columns=columns)
+
+    grouped = (
+        scored.groupby(["Field", "Category"], dropna=False)
+        .agg(
+            Matches=("Match", lambda s: int(s.eq(True).sum())),
+            **{"Scored plays": ("Match", "size")},
+        )
+        .reset_index()
+    )
+    grouped["Accuracy"] = grouped["Matches"] / grouped["Scored plays"]
+    return grouped.sort_values(
+        ["Category", "Field"],
+        ascending=[True, True],
+    ).reset_index(drop=True)
+
