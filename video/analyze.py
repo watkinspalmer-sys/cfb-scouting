@@ -132,6 +132,84 @@ class PostSnapPass(BaseModel):
     notes: str = ""
 
 
+class StructurePassV21(BaseModel):
+    """Mechanical pre-snap observations with mutually exclusive eligible-player buckets."""
+
+    back_count: Optional[int] = Field(default=None, ge=0, le=3)
+    attached_te_count: Optional[int] = Field(default=None, ge=0, le=3)
+    wing_hback_count: Optional[int] = Field(default=None, ge=0, le=3)
+    flexed_te_count: Optional[int] = Field(default=None, ge=0, le=3)
+    split_wr_count: Optional[int] = Field(default=None, ge=0, le=5)
+
+    formation_family: Optional[Literal["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]] = None
+    initial_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    final_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    initial_backfield_shape: Optional[Literal["Single back", "Split backs", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+    final_backfield_shape: Optional[Literal["Single back", "Split backs", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+    formation_strength: Optional[Literal["Left", "Right", "Balanced", "Boundary", "Field", "Unknown"]] = None
+
+    defensive_personnel: Optional[str] = None
+    front_family: Optional[Literal["Even", "Odd", "Bear", "Mint/Tite", "Other", "Unknown"]] = None
+    initial_line_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    initial_second_level_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    snap_line_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    snap_second_level_box_defenders: Optional[int] = Field(default=None, ge=0, le=11)
+    shell: Optional[Literal["1-High", "2-High", "0-High", "Unknown"]] = None
+
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class MovementPassV21(BaseModel):
+    """Mechanical movement tracking from the first settled set to the instant before the snap."""
+
+    any_player_moving_at_snap: Optional[bool] = None
+    any_alignment_change_set_before_snap: Optional[bool] = None
+    primary_mover: Optional[str] = None
+    movement_type: Optional[Literal["Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other", "Unknown"]] = None
+    movement_direction: Optional[str] = None
+    movement_start_alignment: Optional[str] = None
+    movement_end_alignment: Optional[str] = None
+
+    rb_initial_side: Optional[Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]] = None
+    rb_final_side: Optional[Literal["Left", "Right", "Behind", "Multiple", "None", "Unknown"]] = None
+    rb_changed_sides: Optional[bool] = None
+    rb_set_before_snap: Optional[bool] = None
+
+    adjustment_trigger: Optional[Literal["None", "Motion", "Shift", "Defensive stem", "Cadence/check", "Other", "Unknown"]] = None
+    adjustment_type: Optional[Literal["None", "Bump", "Travel", "Safety rotation", "Front shift", "Box insert", "Box remove", "Other", "Unknown"]] = None
+    adjustment_player: Optional[str] = None
+    adjustment_detail: Optional[str] = None
+
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class PostSnapPassV21(BaseModel):
+    """Post-snap recognition with mechanical rusher accounting."""
+
+    film_play_type: Optional[Literal["Run", "Pass", "RPO", "Scramble", "Sack", "Other", "Unknown"]] = None
+    run_concept: Optional[str] = None
+    run_direction: Optional[Literal["Left", "Right", "Middle", "Boundary", "Field", "Unknown"]] = None
+    pass_concept: Optional[str] = None
+    rpo: Optional[bool] = None
+    play_action: Optional[bool] = None
+
+    immediate_rushers_count: Optional[int] = Field(default=None, ge=0, le=11)
+    delayed_rushers_count: Optional[int] = Field(default=0, ge=0, le=11)
+    bluff_or_drop_count: Optional[int] = Field(default=None, ge=0, le=11)
+    nontraditional_rushers_count: Optional[int] = Field(default=None, ge=0, le=11)
+    pressure_family_observed: Optional[Literal["Standard rush", "Blitz", "Sim pressure", "Creeper", "Zero pressure", "Unknown"]] = None
+    pressure_source: Optional[str] = None
+    coverage: Optional[str] = None
+
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
 def _json_safe(value):
     """Convert pandas/numpy scalar values into normal JSON-safe Python values."""
     if value is None:
@@ -297,6 +375,128 @@ rush count, or coverage for you. Prefer Unknown/null over a confident guess.
 """
 
 
+def _structure_prompt_v21(play_context: dict) -> str:
+    context = _context(play_context)
+    return f"""
+You are doing ONLY a MECHANICAL PRE-SNAP STRUCTURE count for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Do NOT return personnel shorthand such as 10/11/20. Count the five non-QB, non-offensive-line
+eligible skill players using MUTUALLY EXCLUSIVE buckets. Every eligible player should belong to
+exactly one bucket:
+
+- back_count: RB/FB players by body type/role, even if one is split wide.
+- attached_te_count: true TE/Y aligned on or immediately next to the offensive line.
+- wing_hback_count: TE/H-back aligned as a wing/off the tackle. Do NOT also count him as a back.
+- flexed_te_count: true TE body/role detached into slot or wide alignment.
+- split_wr_count: true WRs. Do not put a TE in this bucket merely because he is split out.
+
+SANITY CHECK:
+back_count + attached_te_count + wing_hback_count + flexed_te_count + split_wr_count should equal 5.
+If you cannot visually distinguish TE vs WR, use null for the uncertain bucket rather than defaulting
+to 11 personnel. The play-by-play must NOT be used to decide player positions.
+
+Also chart:
+- QB formation family.
+- receiver distribution at the earliest settled alignment and again immediately before the snap.
+- whether the backfield is single-back, split-backs, pistol-dot, or empty at those two moments.
+- formation strength only if clearly supported.
+
+DEFENSIVE BOX COUNT:
+Do NOT give one intuitive 'box count'. Count two layers separately at the earliest settled picture
+and again immediately before the snap:
+1. line_box_defenders = defenders on/near the LOS who are structurally part of the run front,
+   including edge defenders aligned tight enough to be a run-box player.
+2. second_level_box_defenders = linebackers/safeties between roughly 2-6 yards of the LOS and
+   inside the offensive core who are structurally committed to the box.
+
+The Python code will add those layers to create the box total. Do not omit an edge defender merely
+because he is just outside the offensive tackle.
+
+Finally identify defensive personnel when visible, front family (Even/Odd/Bear/Mint-Tite/etc.),
+and the PRE-SNAP safety shell only. Prefer Unknown/null to a default guess.
+"""
+
+
+def _movement_prompt_v21(play_context: dict) -> str:
+    context = _context(play_context)
+    return f"""
+You are doing ONLY a MECHANICAL PRE-SNAP MOVEMENT TRACK for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Your most important job is to compare TWO moments:
+A) the earliest settled offensive alignment visible in the clip
+B) the final instant immediately before the snap
+
+For the RB/back specifically:
+- record rb_initial_side relative to the QB: Left, Right, Behind, Multiple, None, or Unknown.
+- record rb_final_side using the same choices.
+- explicitly answer rb_changed_sides.
+- explicitly answer rb_set_before_snap.
+
+Example: if the RB starts to the QB's RIGHT, moves to the QB's LEFT, then becomes stationary
+before the snap:
+rb_initial_side=Right, rb_final_side=Left, rb_changed_sides=true,
+rb_set_before_snap=true, any_alignment_change_set_before_snap=true,
+any_player_moving_at_snap=false.
+
+Definitions used by our code:
+- any_player_moving_at_snap=true means MOTION.
+- any_alignment_change_set_before_snap=true means a SHIFT occurred.
+Both may be true on a play if a shift occurs and a different player later motions.
+
+Also describe the primary mover's generic position, start/end alignment, direction and movement type.
+Do not infer movement from the play result. Watch the pre-snap sequence itself frame by frame.
+
+For the defense, record any pre-snap response: bump, travel, safety rotation, front shift,
+box insert/remove, or other stem/check. Prefer Unknown/null over inventing movement.
+"""
+
+
+def _postsnap_prompt_v21(play_context: dict) -> str:
+    context = _context(play_context)
+    return f"""
+You are doing ONLY the POST-SNAP pass for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Chart run/pass/RPO/scramble/sack, concept only when clearly supported, play action, pressure,
+and coverage. Keep the existing conservative coverage approach: pre-snap shell does NOT determine
+post-snap coverage, and a defense may show 2-High then rotate to Cover 1.
+
+RUSHER ACCOUNTING IS THE PRIORITY:
+At the snap, track each defender who threatens the line.
+
+- immediate_rushers_count: defenders whose first post-snap action commits them into the rush,
+  attacking the LOS/backfield/pass protection.
+- delayed_rushers_count: defenders who initially hesitate/fit/cover, then clearly add to the rush.
+- bluff_or_drop_count: defenders who threaten pressure pre-snap but actually drop/cover.
+- nontraditional_rushers_count: rushing DB/LB players replacing a traditional DL/edge who drops.
+
+Do not count a defender as a rusher because he merely shows pressure before the snap.
+Do not stop counting at the first four rushers. Follow the first several seconds after the snap.
+The Python code will derive total rushers as immediate + delayed and will derive blitz=true at 5+.
+
+Pressure family:
+- 5+ actual rushers: normally Blitz (or Zero pressure if clearly zero-man pressure).
+- 4 rushers with a nontraditional rusher replacing a dropping traditional rusher can be Sim/Creeper.
+- QB pressure alone does not equal blitz.
+
+Coverage:
+- identify the actual post-snap coverage when the broadcast angle supports it.
+- 2-High pre-snap rotating to Cover 1 post-snap is valid.
+- use Unknown when deep coverage leaves the broadcast frame too early.
+
+The play-by-play may provide outcome context only; it must not decide rush count, pressure, concept,
+or coverage. Prefer Unknown/null over a confident guess.
+"""
+
+
 def _derive_personnel(rb_count: Optional[int], te_count: Optional[int]) -> Optional[str]:
     if rb_count is None or te_count is None:
         return "Unknown"
@@ -323,6 +523,69 @@ def _derive_pressure(rushers: Optional[int], observed: Optional[str]) -> tuple[O
         return False, observed
 
     return False, observed if observed not in {None, "Blitz"} else "Standard rush"
+
+
+def _derive_personnel_v21(
+    back_count: Optional[int],
+    attached_te_count: Optional[int],
+    wing_hback_count: Optional[int],
+    flexed_te_count: Optional[int],
+    split_wr_count: Optional[int],
+) -> tuple[str, Optional[int], Optional[int]]:
+    counts = [back_count, attached_te_count, wing_hback_count, flexed_te_count, split_wr_count]
+    if any(value is None for value in counts):
+        return "Unknown", None, None
+
+    te_count = int(attached_te_count) + int(wing_hback_count) + int(flexed_te_count)
+    eligible_total = int(back_count) + te_count + int(split_wr_count)
+    if eligible_total != 5:
+        return "Unknown", te_count, eligible_total
+
+    personnel = _derive_personnel(int(back_count), te_count)
+    return personnel or "Unknown", te_count, eligible_total
+
+
+def _sum_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    if a is None or b is None:
+        return None
+    return int(a) + int(b)
+
+
+def _backfield_from_shape_and_side(shape: Optional[str], side: Optional[str]) -> Optional[str]:
+    if shape in {"Split backs", "Pistol dot", "Empty"}:
+        return shape
+    if side == "Right":
+        return "RB right"
+    if side == "Left":
+        return "RB left"
+    if side == "Behind":
+        return "Pistol dot"
+    if side == "Multiple":
+        return "Split backs"
+    if side == "None":
+        return "Empty"
+    if shape in {"Other", "Unknown"}:
+        return shape
+    return "Unknown"
+
+
+def _derive_movement_v21(movement: MovementPassV21) -> tuple[Optional[bool], Optional[bool]]:
+    motion_present = movement.any_player_moving_at_snap
+    shift_present = movement.any_alignment_change_set_before_snap
+
+    if movement.rb_changed_sides is True and movement.rb_set_before_snap is True:
+        shift_present = True
+    if movement.rb_changed_sides is True and movement.rb_set_before_snap is False:
+        motion_present = True
+
+    return motion_present, shift_present
+
+
+def _derive_rushers_v21(post: PostSnapPassV21) -> Optional[int]:
+    if post.immediate_rushers_count is None:
+        return None
+    delayed = post.delayed_rushers_count or 0
+    return int(post.immediate_rushers_count) + int(delayed)
 
 
 def _merge_uncertain(*passes: BaseModel) -> list[str]:
@@ -526,6 +789,177 @@ def analyze_clip_gemini_v2(
                 "te_count": structure.te_count,
                 "personnel_rule": "RB/TE counts -> personnel grouping",
                 "blitz_rule": "5+ actual rushers -> blitz",
+            },
+            "_pass_confidence": {
+                "structure": structure.confidence,
+                "movement": movement.confidence,
+                "post_snap": post.confidence,
+            },
+            "_passes": {
+                "structure": structure.model_dump(),
+                "movement": movement.model_dump(),
+                "post_snap": post.model_dump(),
+            },
+        }
+        return result
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+
+def analyze_clip_gemini_v21(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V2.1: three specialized calls, but with mechanical counting and deterministic derivation.
+
+    The video is uploaded once. Personnel, backfield changes, box totals and blitz are calculated
+    from lower-level visual observations instead of asking Gemini for the final shorthand directly.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        structure = _call_structured(
+            client, uploaded, model, fps, _structure_prompt_v21(play_context), StructurePassV21
+        )
+        time.sleep(1)
+        movement = _call_structured(
+            client, uploaded, model, fps, _movement_prompt_v21(play_context), MovementPassV21
+        )
+        time.sleep(1)
+        post = _call_structured(
+            client, uploaded, model, fps, _postsnap_prompt_v21(play_context), PostSnapPassV21
+        )
+
+        personnel, te_count, eligible_total = _derive_personnel_v21(
+            structure.back_count,
+            structure.attached_te_count,
+            structure.wing_hback_count,
+            structure.flexed_te_count,
+            structure.split_wr_count,
+        )
+
+        initial_box_count = _sum_optional(
+            structure.initial_line_box_defenders,
+            structure.initial_second_level_box_defenders,
+        )
+        snap_box_count = _sum_optional(
+            structure.snap_line_box_defenders,
+            structure.snap_second_level_box_defenders,
+        )
+
+        initial_backfield = _backfield_from_shape_and_side(
+            structure.initial_backfield_shape,
+            movement.rb_initial_side,
+        )
+        final_backfield = _backfield_from_shape_and_side(
+            structure.final_backfield_shape,
+            movement.rb_final_side,
+        )
+
+        motion_present, shift_present = _derive_movement_v21(movement)
+        rushers = _derive_rushers_v21(post)
+        blitz, pressure_family = _derive_pressure(rushers, post.pressure_family_observed)
+
+        shift_description = None
+        if shift_present:
+            if movement.rb_changed_sides:
+                shift_description = (
+                    f"RB changed from {movement.rb_initial_side} to {movement.rb_final_side} "
+                    f"and {'set' if movement.rb_set_before_snap else 'did not set'} before snap"
+                )
+            elif movement.primary_mover:
+                shift_description = (
+                    f"{movement.primary_mover}: {movement.movement_start_alignment} -> "
+                    f"{movement.movement_end_alignment}"
+                )
+
+        result = {
+            "personnel": personnel,
+            "formation_family": structure.formation_family,
+            "initial_formation": structure.initial_receiver_structure,
+            "initial_backfield": initial_backfield,
+            "final_formation": structure.final_receiver_structure,
+            "final_backfield": final_backfield,
+            "formation_strength": structure.formation_strength,
+
+            "motion_present": motion_present,
+            "motion_player": movement.primary_mover if motion_present else None,
+            "motion_type": movement.movement_type if motion_present else None,
+            "motion_direction": movement.movement_direction if motion_present else None,
+            "motion_start_alignment": movement.movement_start_alignment if motion_present else None,
+            "motion_end_alignment": movement.movement_end_alignment if motion_present else None,
+            "shift_present": shift_present,
+            "shift_description": shift_description,
+
+            "film_play_type": post.film_play_type,
+            "run_concept": post.run_concept,
+            "run_direction": post.run_direction,
+            "pass_concept": post.pass_concept,
+            "rpo": post.rpo,
+            "play_action": post.play_action,
+
+            "defensive_personnel": structure.defensive_personnel,
+            "front": structure.front_family,
+            "initial_box_count": initial_box_count,
+            "snap_box_count": snap_box_count,
+            "shell": structure.shell,
+            "coverage": post.coverage,
+            "rushers": rushers,
+            "blitz": blitz,
+            "pressure_family": pressure_family,
+            "pressure_source": post.pressure_source,
+
+            "adjustment_trigger": movement.adjustment_trigger,
+            "adjustment_type": movement.adjustment_type,
+            "adjustment_player": movement.adjustment_player,
+            "adjustment_detail": movement.adjustment_detail,
+
+            "overall_confidence": _pass_confidence_average(structure, movement, post),
+            "uncertain_fields": _merge_uncertain(structure, movement, post),
+            "analysis_notes": " | ".join(
+                note for note in (structure.notes, movement.notes, post.notes) if note
+            ),
+
+            "_model": model,
+            "_video_fps": float(fps),
+            "_provider": "google-gemini",
+            "_analyzer_version": "v2.1-mechanical",
+            "_derived": {
+                "back_count": structure.back_count,
+                "attached_te_count": structure.attached_te_count,
+                "wing_hback_count": structure.wing_hback_count,
+                "flexed_te_count": structure.flexed_te_count,
+                "te_count": te_count,
+                "split_wr_count": structure.split_wr_count,
+                "eligible_total": eligible_total,
+                "personnel_rule": "5 eligible-player buckets -> RB/TE personnel grouping",
+                "rb_initial_side": movement.rb_initial_side,
+                "rb_final_side": movement.rb_final_side,
+                "rb_changed_sides": movement.rb_changed_sides,
+                "rb_set_before_snap": movement.rb_set_before_snap,
+                "initial_line_box_defenders": structure.initial_line_box_defenders,
+                "initial_second_level_box_defenders": structure.initial_second_level_box_defenders,
+                "snap_line_box_defenders": structure.snap_line_box_defenders,
+                "snap_second_level_box_defenders": structure.snap_second_level_box_defenders,
+                "immediate_rushers_count": post.immediate_rushers_count,
+                "delayed_rushers_count": post.delayed_rushers_count,
+                "bluff_or_drop_count": post.bluff_or_drop_count,
+                "nontraditional_rushers_count": post.nontraditional_rushers_count,
+                "blitz_rule": "immediate + delayed actual rushers; 5+ -> blitz",
             },
             "_pass_confidence": {
                 "structure": structure.confidence,
