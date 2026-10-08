@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4
 
 
 ANALYZERS = {
-    "V3.4 snap-centered temporal (recommended)": ("v3.4-snap-centered", analyze_clip_gemini_v34),
+    "V4 native video + corrective pass (recommended)": ("v4-native-corrective", analyze_clip_gemini_v4),
+    "V3.4 snap-centered temporal": ("v3.4-snap-centered", analyze_clip_gemini_v34),
     "V3.3 two-pass temporal": ("v3.3-two-pass-temporal", analyze_clip_gemini_v33),
     "V3.2 temporal diagnostic 1-pass": ("v3.2-temporal-diagnostic", analyze_clip_gemini_v32_diagnostic),
     "V3.1 temporal frames 1-pass": ("v3.1-temporal-frames", analyze_clip_gemini_v31),
@@ -228,7 +229,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v3.4-snap-centered":
+            if analyzer_version == "v4-native-corrective":
+                passes = "two native-video passes"
+            elif analyzer_version == "v3.4-snap-centered":
                 passes = "three snap-centered temporal passes"
             elif analyzer_version == "v3.3-two-pass-temporal":
                 passes = "two focused temporal passes"
@@ -274,7 +277,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -283,7 +286,28 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v3.4-snap-centered":
+        if analyzer_version == "v4-native-corrective":
+            st.caption(
+                "V4 keeps the V1 native-video chart as the foundation, then runs one narrow "
+                "native-video correction pass. Only personnel, initial/final receiver structure, "
+                "initial/final backfield, motion type, and run direction can be overwritten."
+            )
+            field_sources = prediction.get("_field_sources") or {}
+            correction_mechanics = prediction.get("_correction_mechanics") or {}
+            corrected = [
+                field for field, source in field_sources.items()
+                if source == "v4-correction"
+            ]
+            st.write("**Fields replaced by corrective pass:**", corrected if corrected else "None")
+            st.write(
+                "**Personnel correction counts:**",
+                {
+                    "backs": correction_mechanics.get("personnel_back_count"),
+                    "TEs": correction_mechanics.get("personnel_te_count"),
+                    "direct personnel": correction_mechanics.get("personnel_direct"),
+                },
+            )
+        elif analyzer_version == "v3.4-snap-centered":
             st.caption(
                 "V3.4 first locates the snap from coarse frames, then re-extracts a dense timeline "
                 "from -5.0s to +4.0s around that estimated snap. Pre-snap and post-snap analysis "
@@ -738,7 +762,14 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v3.4-snap-centered":
+    if analyzer_version == "v4-native-corrective":
+        st.info(
+            "V4 uploads the clip once and makes 2 native-video Gemini calls: the original broad "
+            "V1 chart plus a narrow corrective pass for only the historically weak offensive "
+            "structure fields. Strong V1 fields such as front, shell, play type, RPO, play action, "
+            "rushers/blitz, and coverage are protected from the second pass."
+        )
+    elif analyzer_version == "v3.4-snap-centered":
         st.info(
             "V3.4 uses 3 Gemini requests per snap: a tiny coarse snap locator, then focused "
             "pre-snap and post-snap passes over newly extracted snap-centered frames. The expensive "
@@ -869,6 +900,8 @@ def _render_batch(
             if position < len(eligible):
                 if analyzer_version in {"v2-specialized", "v2.1-mechanical"}:
                     time.sleep(8)
+                elif analyzer_version == "v4-native-corrective":
+                    time.sleep(7)
                 elif analyzer_version == "v3.4-snap-centered":
                     time.sleep(8)
                 elif analyzer_version == "v3.3-two-pass-temporal":
@@ -908,7 +941,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -975,8 +1008,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V3.4 first locates the snap from coarse frames, then re-extracts dense football-relative "
-        "frames around that snap for focused pre-snap and post-snap analysis."
+        "V4 uses the proven V1 native-video chart as its foundation, then adds one narrow "
+        "native-video corrective pass for historically weak offensive structure fields."
     )
 
     chart = load_film_chart()
@@ -999,7 +1032,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V3.4 for the current snap-centered temporal benchmark. Older analyzers remain available as baselines.",
+        help="Use V4 for the current native-video corrective benchmark. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
@@ -1014,7 +1047,7 @@ def main():
         max_value=5.0,
         value=5.0,
         step=0.5,
-        help="Used by V1/V2 native-video analysis. V3/V3.1 ignore this and use local temporal frames.",
+        help="Used by V1/V2/V4 native-video analysis. V3-family still-frame analyzers ignore this where noted.",
     )
     use_play_text = st.checkbox(
         "Give the model CFBD play-by-play context",
