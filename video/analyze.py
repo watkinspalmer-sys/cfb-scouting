@@ -67,6 +67,28 @@ class FootballSnapChart(BaseModel):
 
 
 
+
+
+class NativeCorrectionV4(BaseModel):
+    """Narrow second native-video pass for fields where V1 historically underperforms."""
+
+    personnel: Optional[Literal["10", "11", "12", "13", "20", "21", "22", "Other", "Unknown"]] = None
+    back_count: Optional[int] = Field(default=None, ge=0, le=3)
+    te_count: Optional[int] = Field(default=None, ge=0, le=4)
+
+    initial_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    initial_backfield: Optional[Literal["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+    final_receiver_structure: Optional[Literal["2x2", "3x1", "2x1", "3x2", "Quads", "Unbalanced", "Other", "Unknown"]] = None
+    final_backfield: Optional[Literal["Split backs", "RB left", "RB right", "Pistol dot", "Empty", "Other", "Unknown"]] = None
+
+    motion_type: Optional[Literal["Across", "Jet", "Orbit", "Return", "Short", "Out to slot/wide", "Into backfield", "Trade", "Other", "Unknown"]] = None
+    run_direction: Optional[Literal["Left", "Right", "Middle", "Boundary", "Field", "Unknown"]] = None
+
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
 class TemporalEvidenceChart(BaseModel):
     """One-pass chart from timestamped chronological contact sheets."""
     snap_frame_index: Optional[int] = Field(default=None, ge=1)
@@ -418,6 +440,69 @@ Charting rules:
 
 Pay special attention to the several seconds immediately before the snap so that
 motions, shifts, defensive bumps, safety rotations, and box changes are not missed.
+"""
+
+
+
+
+def _native_correction_prompt_v4(play_context: dict, foundation: dict) -> str:
+    context = _context(play_context)
+    foundation_subset = {
+        "personnel": foundation.get("personnel"),
+        "initial_formation": foundation.get("initial_formation"),
+        "initial_backfield": foundation.get("initial_backfield"),
+        "final_formation": foundation.get("final_formation"),
+        "final_backfield": foundation.get("final_backfield"),
+        "motion_present": foundation.get("motion_present"),
+        "motion_type": foundation.get("motion_type"),
+        "film_play_type": foundation.get("film_play_type"),
+        "run_direction": foundation.get("run_direction"),
+    }
+
+    return f"""
+You are the SECOND-PASS QUALITY-CONTROL analyst for ONE college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+A broad first-pass model produced these values for ONLY the fields you are checking:
+{json.dumps(foundation_subset, indent=2)}
+
+Watch the ENTIRE native video again from beginning to end. Independently re-chart ONLY the
+specific weak fields below. Do not simply agree with the first pass.
+
+1. PERSONNEL
+Personnel means WHO is on the field, not where players line up at the snap.
+Count RB/FB players as back_count and true TE/Y/H players as te_count.
+A RB split wide is still a RB. A TE flexed into the slot is still a TE.
+Use those identity counts across the entire pre-snap sequence, not just the final alignment.
+Also return the personnel shorthand (10/11/12/13/20/21/22) that best matches those counts.
+Do not default to 11 personnel just because it is common.
+
+2. EARLIEST SETTLED OFFENSIVE ALIGNMENT
+initial_receiver_structure and initial_backfield describe the EARLIEST clearly settled formation
+visible before any shift or motion. Do not substitute the alignment at the snap.
+For initial_backfield, track the primary RB relative to the QB.
+
+3. FINAL ALIGNMENT AT THE SNAP
+final_receiver_structure and final_backfield describe the offense immediately before the snap.
+
+4. MOTION TYPE
+Only chart motion_type when a player is actually moving immediately before/through the snap.
+The broad first pass's motion_present value is shown above for context, but your job here is only
+to classify the motion type when it is visibly present.
+
+5. RUN DIRECTION
+Only chart run_direction when the video clearly shows a run/RPO run path.
+Use the runner's actual attack path, not the play-by-play wording.
+
+IMPORTANT:
+- This pass is NOT allowed to re-chart formation family, front, box count, shell, play type,
+  RPO, play action, rushers, blitz, pressure, coverage, or defensive adjustments.
+- The first-pass values are context, not ground truth.
+- Use Unknown/null when a targeted field truly cannot be determined.
+- uncertain_fields should list only these targeted correction fields that need human review.
+- In notes, briefly explain any correction that differs from the first-pass value.
 """
 
 
@@ -1209,6 +1294,26 @@ def _derive_rushers_v21(post: PostSnapPassV21) -> Optional[int]:
     return int(post.immediate_rushers_count) + int(delayed)
 
 
+
+
+def _usable_correction(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip().lower() in {"", "unknown", "none", "null"}:
+        return False
+    return True
+
+
+def _v4_personnel_from_correction(correction: NativeCorrectionV4) -> Optional[str]:
+    if correction.back_count is not None and correction.te_count is not None:
+        derived = _derive_personnel(correction.back_count, correction.te_count)
+        if derived not in {None, "Unknown", "Other"}:
+            return derived
+    if _usable_correction(correction.personnel):
+        return correction.personnel
+    return None
+
+
 def _merge_uncertain(*passes: BaseModel) -> list[str]:
     seen = []
     for item in passes:
@@ -1308,6 +1413,133 @@ def analyze_clip_gemini(
         result["_provider"] = "google-gemini"
         result["_analyzer_version"] = "v1-single-pass"
         return result
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+
+
+
+def analyze_clip_gemini_v4(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4: V1 native-video foundation plus one narrow corrective native-video pass.
+
+    The second pass may overwrite only historically weak fields. Strong V1 fields remain
+    untouched. The video is uploaded once and reused for both calls.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        foundation_chart = _call_structured(
+            client,
+            uploaded,
+            model,
+            fps,
+            _prompt(play_context),
+            FootballSnapChart,
+        )
+        foundation = foundation_chart.model_dump()
+
+        time.sleep(1)
+
+        correction = _call_structured(
+            client,
+            uploaded,
+            model,
+            fps,
+            _native_correction_prompt_v4(play_context, foundation),
+            NativeCorrectionV4,
+        )
+
+        result = dict(foundation)
+        field_sources = {key: "v1-foundation" for key in foundation.keys()}
+
+        personnel_correction = _v4_personnel_from_correction(correction)
+        if _usable_correction(personnel_correction):
+            result["personnel"] = personnel_correction
+            field_sources["personnel"] = "v4-correction"
+
+        correction_map = {
+            "initial_formation": correction.initial_receiver_structure,
+            "initial_backfield": correction.initial_backfield,
+            "final_formation": correction.final_receiver_structure,
+            "final_backfield": correction.final_backfield,
+        }
+        for key, value in correction_map.items():
+            if _usable_correction(value):
+                result[key] = value
+                field_sources[key] = "v4-correction"
+
+        # Preserve V1's motion-present judgment. The correction pass only labels the type
+        # when V1 already says motion occurred.
+        if result.get("motion_present") is True and _usable_correction(correction.motion_type):
+            result["motion_type"] = correction.motion_type
+            field_sources["motion_type"] = "v4-correction"
+
+        # Preserve V1 play classification. Only correct direction when V1 says the play
+        # involved a run/RPO and the correction pass can actually see a direction.
+        if result.get("film_play_type") in {"Run", "RPO"} and _usable_correction(correction.run_direction):
+            result["run_direction"] = correction.run_direction
+            field_sources["run_direction"] = "v4-correction"
+
+        foundation_notes = str(result.get("analysis_notes") or "").strip()
+        correction_notes = str(correction.notes or "").strip()
+        result["analysis_notes"] = " | ".join(
+            part for part in (
+                foundation_notes,
+                f"V4 correction: {correction_notes}" if correction_notes else "",
+            )
+            if part
+        )
+
+        foundation_uncertain = list(result.get("uncertain_fields") or [])
+        correction_uncertain = list(correction.uncertain_fields or [])
+        result["uncertain_fields"] = list(dict.fromkeys(foundation_uncertain + correction_uncertain))
+
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v4-native-corrective"
+        result["_field_sources"] = field_sources
+        result["_pass_confidence"] = {
+            "v1_foundation": foundation.get("overall_confidence"),
+            "targeted_correction": correction.confidence,
+        }
+        result["_passes"] = {
+            "v1_foundation": foundation,
+            "targeted_correction": correction.model_dump(),
+        }
+        result["_correction_targets"] = [
+            "personnel",
+            "initial_formation",
+            "initial_backfield",
+            "final_formation",
+            "final_backfield",
+            "motion_type",
+            "run_direction",
+        ]
+        result["_correction_mechanics"] = {
+            "personnel_back_count": correction.back_count,
+            "personnel_te_count": correction.te_count,
+            "personnel_direct": correction.personnel,
+        }
+        return result
+
     finally:
         if uploaded is not None and uploaded.name:
             try:
