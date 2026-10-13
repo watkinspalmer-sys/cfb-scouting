@@ -9,13 +9,14 @@ import streamlit as st
 
 from analytics.benchmark import category_summary, compare_prediction, field_summary, score_prediction
 from data.ai_store import load_ai_predictions, save_ai_prediction
-from data.cfbd import fetch_week_plays
+from data.cfbd import fetch_roster, fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel
 
 
 ANALYZERS = {
-    "V4.3 repeatability + separate personnel pass (recommended)": ("v4.3-repeatability-separated-personnel", analyze_clip_gemini_v43_repeatability_with_personnel_pass),
+    "V4.4 roster-assisted personnel (recommended)": ("v4.4-roster-assisted-personnel", analyze_clip_gemini_v44_roster_personnel),
+    "V4.3 repeatability + separate personnel pass": ("v4.3-repeatability-separated-personnel", analyze_clip_gemini_v43_repeatability_with_personnel_pass),
     "V4.2 repeatability + mechanical personnel": ("v4.2-mechanical-personnel-repeatability", analyze_clip_gemini_v42_personnel_repeatability),
     "V4.1 repeatability diagnostic — 5x V1": ("v4.1-repeatability", analyze_clip_gemini_v41_repeatability),
     "V4 native video + corrective pass": ("v4-native-corrective", analyze_clip_gemini_v4),
@@ -124,6 +125,117 @@ def _play_context(row: pd.Series, side: str, use_play_text: bool) -> dict:
     }
 
 
+
+
+def _position_text(value) -> str:
+    if isinstance(value, dict):
+        return str(
+            value.get("abbreviation")
+            or value.get("position")
+            or value.get("name")
+            or value.get("displayName")
+            or ""
+        ).strip()
+    return str(_clean(value, "")).strip()
+
+
+def _skill_role_from_roster_position(position) -> str | None:
+    text = _position_text(position).upper().replace("-", " ").replace("_", " ")
+    compact = " ".join(text.split())
+
+    if compact in {"RB", "HB", "TB", "FB"} or "RUNNING BACK" in compact or "FULLBACK" in compact:
+        return "RB/FB"
+    if compact in {"TE", "H BACK", "HBACK"} or "TIGHT END" in compact:
+        return "TE/H-back"
+    if compact == "WR" or "WIDE RECEIVER" in compact:
+        return "WR"
+    return None
+
+
+def _roster_skill_entries(roster: pd.DataFrame) -> list[dict]:
+    entries = []
+    if roster.empty:
+        return entries
+
+    for _, row in roster.iterrows():
+        role = _skill_role_from_roster_position(row.get("position"))
+        if role is None:
+            continue
+
+        jersey = _clean(row.get("jersey"), None)
+        if jersey is None:
+            continue
+
+        try:
+            jersey_text = str(int(float(jersey)))
+        except (TypeError, ValueError):
+            jersey_text = str(jersey).strip()
+
+        name = str(_clean(row.get("name"), "")).strip()
+        if not name:
+            first = str(_clean(row.get("firstName"), "")).strip()
+            last = str(_clean(row.get("lastName"), "")).strip()
+            name = " ".join(part for part in (first, last) if part)
+
+        entries.append(
+            {
+                "jersey": jersey_text,
+                "name": name,
+                "position": _position_text(row.get("position")),
+                "role": role,
+            }
+        )
+
+    entries.sort(key=lambda item: (int(item["jersey"]) if item["jersey"].isdigit() else 999, item["name"]))
+    return entries
+
+
+def _offense_team_for_row(row: pd.Series, cfbd_key: str | None) -> str | None:
+    if not cfbd_key:
+        return None
+    required = ("team", "year", "week", "play_id")
+    if any(_clean(row.get(field), None) is None for field in required):
+        return None
+
+    try:
+        plays = fetch_week_plays(
+            str(row.get("team")),
+            int(row.get("year")),
+            int(row.get("week")),
+            cfbd_key,
+        )
+    except Exception:
+        return None
+
+    if plays.empty or "id" not in plays.columns:
+        return None
+
+    target = _id_text(row.get("play_id"))
+    matches = plays[plays["id"].map(_id_text).eq(target)]
+    if matches.empty:
+        return None
+    return str(_clean(matches.iloc[0].get("offense"), "")).strip() or None
+
+
+def _v44_roster_context(row: pd.Series, cfbd_key: str | None) -> dict:
+    offense_team = _offense_team_for_row(row, cfbd_key)
+    if not offense_team:
+        raise ValueError("Could not determine the offensive team from CFBD for this play.")
+
+    year = int(row.get("year"))
+    roster = fetch_roster(offense_team, year, cfbd_key)
+    skill_roster = _roster_skill_entries(roster)
+    if not skill_roster:
+        raise ValueError(
+            f"No RB/FB, TE/H-back, or WR roster entries were found for {offense_team} {year}."
+        )
+
+    return {
+        "offense_team": offense_team,
+        "offense_skill_roster": skill_roster,
+    }
+
+
 def _render_comparison(human: pd.Series, prediction: dict):
     comparison = compare_prediction(human.to_dict(), prediction)
     matches, total, accuracy = score_prediction(comparison)
@@ -165,10 +277,14 @@ def _run_analyzer(
     api_key: str,
     model: str,
     video_fps: float,
+    extra_context: dict | None = None,
 ):
+    context = _play_context(human, side, use_play_text)
+    if extra_context:
+        context.update(extra_context)
     return analyzer_fn(
         clip_path=clip_path,
-        play_context=_play_context(human, side, use_play_text),
+        play_context=context,
         api_key=api_key,
         model=model.strip(),
         fps=float(video_fps),
@@ -178,6 +294,7 @@ def _run_analyzer(
 def _render_single(
     reviewed: pd.DataFrame,
     side_lookup: dict[str, str],
+    cfbd_key: str | None,
     api_key: str | None,
     model: str,
     video_fps: float,
@@ -232,7 +349,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4.3-repeatability-separated-personnel":
+            if analyzer_version == "v4.4-roster-assisted-personnel":
+                passes = "five full-chart V1 observations plus three roster-assisted jersey-ID observations"
+            elif analyzer_version == "v4.3-repeatability-separated-personnel":
                 passes = "five full-chart V1 observations plus three personnel-only observations"
             elif analyzer_version == "v4.2-mechanical-personnel-repeatability":
                 passes = "five native-video observations with mechanical personnel accounting"
@@ -255,9 +374,12 @@ def _render_single(
             else:
                 passes = "one native-video pass"
             with st.spinner(f"Analyzing with {passes} using {model} at {video_fps:.1f} FPS..."):
+                extra_context = None
+                if analyzer_version == "v4.4-roster-assisted-personnel":
+                    extra_context = _v44_roster_context(human, cfbd_key)
                 prediction = _run_analyzer(
                     analyzer_fn, clip_path, human, role.lower(), use_play_text,
-                    api_key, model, video_fps,
+                    api_key, model, video_fps, extra_context,
                 )
             st.session_state[result_key] = prediction
         except Exception as exc:
@@ -286,7 +408,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -295,7 +417,57 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v4.3-repeatability-separated-personnel":
+        if analyzer_version == "v4.4-roster-assisted-personnel":
+            st.caption(
+                "V4.4 keeps five unchanged V1 full-chart calls, then runs three isolated jersey-ID "
+                "passes. Gemini identifies jersey numbers only; Python maps those numbers to the "
+                "offensive roster and derives personnel from roster positions."
+            )
+            repeatability = prediction.get("_repeatability") or {}
+            personnel = prediction.get("_personnel_accounting") or {}
+            y1, y2, y3, y4 = st.columns(4)
+            y1.metric("Full-chart runs", repeatability.get("run_count", 5))
+            y2.metric("Roster personnel runs", personnel.get("run_count", 3))
+            y3.metric("Valid roster matches", f"{personnel.get('valid_runs', 0)}/3")
+            y4.metric("Consensus personnel", prediction.get("personnel", "—"))
+
+            personnel_runs = personnel.get("runs") or []
+            derived_runs = personnel.get("personnel_runs") or []
+            if personnel_runs:
+                audit_rows = []
+                for run_index, audit in enumerate(personnel_runs, start=1):
+                    audit_rows.append(
+                        {
+                            "Personnel run": run_index,
+                            "Derived personnel": derived_runs[run_index - 1] if run_index - 1 < len(derived_runs) else None,
+                            "OL": audit.get("offensive_lineman_count"),
+                            "QB": audit.get("quarterback_count"),
+                            "RB/FB": audit.get("rb_fb_count"),
+                            "TE/H": audit.get("te_hback_count"),
+                            "WR": audit.get("wr_count"),
+                            "Unknown": audit.get("unknown_eligible_count"),
+                            "Valid": audit.get("valid_accounting"),
+                        }
+                    )
+                st.write("**Roster-assisted personnel runs**")
+                st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
+
+                with st.expander("View jersey-to-roster matches"):
+                    for run_index, audit in enumerate(personnel_runs, start=1):
+                        st.write(f"**Personnel run {run_index}**")
+                        st.dataframe(
+                            pd.DataFrame(audit.get("eligible_players") or []),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+            votes = personnel.get("votes") or []
+            if votes:
+                st.write(
+                    "**Personnel votes:**",
+                    " | ".join(f"{item.get('value')}: {item.get('count')}/3" for item in votes),
+                )
+        elif analyzer_version == "v4.3-repeatability-separated-personnel":
             st.caption(
                 "V4.3 separates the jobs completely: five unchanged V1 calls chart the whole snap, "
                 "while three personnel-only calls perform 5 OL + 1 QB + 5 eligible-player accounting. "
@@ -1042,7 +1214,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4.3-repeatability-separated-personnel":
+    if analyzer_version == "v4.4-roster-assisted-personnel":
+        st.info(
+            "V4.4 is a SINGLE-SNAP diagnostic. It uses five unchanged V1 full-chart calls plus three "
+            "separate jersey-ID calls, then maps visible jerseys to the cached CFBD offensive roster. "
+            "Batch mode is disabled while we validate the roster-assisted personnel method."
+        )
+    elif analyzer_version == "v4.3-repeatability-separated-personnel":
         st.info(
             "V4.3 is a SINGLE-SNAP diagnostic. It uses 5 normal V1 full-chart calls plus 3 separate "
             "personnel-only calls against one uploaded video. The personnel prompt cannot affect any "
@@ -1124,7 +1302,7 @@ def _render_batch(
         bool(use_play_text),
     )
 
-    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
+    if analyzer_version in {"v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
         st.warning(
             "Repeatability diagnostics are intentionally disabled in Batch benchmark. Run this "
             "version from the Single snap tab on Play 1 first; five observations of one snap are "
@@ -1314,8 +1492,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.3 keeps full-snap charting and mechanical personnel accounting in separate model calls, "
-        "so improving personnel cannot suppress or overwrite the rest of the scouting chart."
+        "V4.4 keeps full-snap charting separate from personnel identification: video reads eligible "
+        "jersey numbers, CFBD roster data supplies player positions, and Python derives personnel."
     )
 
     chart = load_film_chart()
@@ -1338,7 +1516,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4.3 on a single snap to test five-run V1 repeatability plus an isolated mechanical personnel pass. Older analyzers remain available as baselines.",
+        help="Use V4.4 on a single snap to test roster-assisted personnel identification while preserving five-run V1 repeatability for the rest of the chart.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
@@ -1369,7 +1547,7 @@ def main():
 
     with single_tab:
         _render_single(
-            reviewed, side_lookup, api_key, model, video_fps, use_play_text,
+            reviewed, side_lookup, cfbd_key, api_key, model, video_fps, use_play_text,
             analyzer_label, analyzer_version, analyzer_fn,
         )
 
