@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability
 
 
 ANALYZERS = {
-    "V4.1 repeatability diagnostic — 5x V1 (recommended)": ("v4.1-repeatability", analyze_clip_gemini_v41_repeatability),
+    "V4.2 repeatability + mechanical personnel (recommended)": ("v4.2-mechanical-personnel-repeatability", analyze_clip_gemini_v42_personnel_repeatability),
+    "V4.1 repeatability diagnostic — 5x V1": ("v4.1-repeatability", analyze_clip_gemini_v41_repeatability),
     "V4 native video + corrective pass": ("v4-native-corrective", analyze_clip_gemini_v4),
     "V3.4 snap-centered temporal": ("v3.4-snap-centered", analyze_clip_gemini_v34),
     "V3.3 two-pass temporal": ("v3.3-two-pass-temporal", analyze_clip_gemini_v33),
@@ -230,7 +231,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4.1-repeatability":
+            if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+                passes = "five native-video observations with mechanical personnel accounting"
+            elif analyzer_version == "v4.1-repeatability":
                 passes = "five independent V1 native-video observations"
             elif analyzer_version == "v4-native-corrective":
                 passes = "two native-video passes"
@@ -280,7 +283,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -289,7 +292,84 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v4.1-repeatability":
+        if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+            st.caption(
+                "V4.2 keeps the five-run repeatability test but replaces direct personnel guessing "
+                "with player accounting: 5 OL + 1 QB + exactly 5 eligible skill players. Each eligible "
+                "player is classified as RB/FB, TE/H-back, WR, or Unknown, and Python derives personnel."
+            )
+            repeatability = prediction.get("_repeatability") or {}
+            personnel = prediction.get("_personnel_accounting") or {}
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Independent runs", repeatability.get("run_count", 5))
+            p2.metric("Valid personnel accounting", f"{personnel.get('valid_runs', 0)}/5")
+            p3.metric("Consensus personnel", prediction.get("personnel", "—"))
+            unresolved = repeatability.get("no_majority_fields") or []
+            p4.metric("No-majority fields", len(unresolved))
+
+            audits = personnel.get("runs") or []
+            if audits:
+                audit_rows = []
+                for run_index, audit in enumerate(audits, start=1):
+                    audit_rows.append(
+                        {
+                            "Run": run_index,
+                            "OL": audit.get("offensive_lineman_count"),
+                            "QB": audit.get("quarterback_count"),
+                            "RB/FB": audit.get("rb_fb_count"),
+                            "TE/H": audit.get("te_hback_count"),
+                            "WR": audit.get("wr_count"),
+                            "Unknown": audit.get("unknown_eligible_count"),
+                            "Valid": audit.get("valid_accounting"),
+                            "Notes": audit.get("notes"),
+                        }
+                    )
+                st.write("**Mechanical personnel accounting by run**")
+                st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
+
+                with st.expander("View the five eligible-player classifications"):
+                    for run_index, audit in enumerate(audits, start=1):
+                        st.write(f"**Run {run_index}**")
+                        players = audit.get("eligible_players") or []
+                        st.dataframe(pd.DataFrame(players), hide_index=True, use_container_width=True)
+
+            runs = repeatability.get("runs") or []
+            if runs:
+                run_rows = []
+                for run_index, run in enumerate(runs, start=1):
+                    run_comp = compare_prediction(human.to_dict(), run)
+                    run_matches, run_total, run_accuracy = score_prediction(run_comp)
+                    run_rows.append(
+                        {
+                            "Run": run_index,
+                            "Personnel": run.get("personnel"),
+                            "Matches": run_matches,
+                            "Scored fields": run_total,
+                            "Accuracy": run_accuracy,
+                            "Model confidence": run.get("overall_confidence"),
+                        }
+                    )
+                run_df = pd.DataFrame(run_rows)
+                run_display = run_df.copy()
+                run_display["Accuracy"] = run_display["Accuracy"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                run_display["Model confidence"] = run_display["Model confidence"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                st.write("**Individual run performance**")
+                st.dataframe(run_display, hide_index=True, use_container_width=True)
+
+            stability = repeatability.get("stability") or {}
+            if stability:
+                personnel_stability = stability.get("personnel") or {}
+                votes = personnel_stability.get("vote_counts") or []
+                if votes:
+                    st.write(
+                        "**Personnel consensus votes:**",
+                        " | ".join(f"{item.get('value')}: {item.get('count')}/5" for item in votes),
+                    )
+        elif analyzer_version == "v4.1-repeatability":
             st.caption(
                 "V4.1 is a repeatability diagnostic. It uploads the clip once, then asks the same "
                 "V1 native-video charting question five independent times. The displayed prediction "
@@ -883,7 +963,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4.1-repeatability":
+    if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+        st.info(
+            "V4.2 is a SINGLE-SNAP diagnostic. It makes five native-video calls, but personnel is "
+            "never accepted directly from Gemini. Each run must account for 5 OL + 1 QB + 5 eligible "
+            "players, and Python derives personnel only from complete valid accounting."
+        )
+    elif analyzer_version == "v4.1-repeatability":
         st.info(
             "V4.1 is a SINGLE-SNAP diagnostic. It makes five independent V1 chart calls against "
             "one uploaded clip and scores a 3-of-5 consensus. Do not use Batch benchmark for this "
@@ -953,10 +1039,11 @@ def _render_batch(
         bool(use_play_text),
     )
 
-    if analyzer_version == "v4.1-repeatability":
+    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
         st.warning(
-            "V4.1 is intentionally disabled in Batch benchmark. Run it from the Single snap tab "
-            "on Play 1 first; five observations of one snap are enough to measure repeatability."
+            "Repeatability diagnostics are intentionally disabled in Batch benchmark. Run this "
+            "version from the Single snap tab on Play 1 first; five observations of one snap are "
+            "enough to evaluate the personnel method and repeatability."
         )
         return
 
@@ -1075,7 +1162,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -1142,8 +1229,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.1 tests whether repeated native-video observations are more reliable than increasingly "
-        "complex specialist pipelines by running the same V1 analysis five times and taking a true majority."
+        "V4.2 tests repeatability while deriving offensive personnel from explicit 5 OL + 1 QB + "
+        "5 eligible-player accounting instead of asking Gemini to recognize personnel shorthand."
     )
 
     chart = load_film_chart()
@@ -1166,7 +1253,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4.1 on a single snap to measure V1 repeatability and majority-vote accuracy. Older analyzers remain available as baselines.",
+        help="Use V4.2 on a single snap to test mechanical personnel accounting plus five-run repeatability. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
