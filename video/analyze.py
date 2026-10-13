@@ -1328,6 +1328,64 @@ def _pass_confidence_average(*passes: BaseModel) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+
+
+def _repeatability_vote_key_v41(value):
+    """Create a stable equality key for repeated structured outputs."""
+    if value is None:
+        return ("none", "")
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return ("number", float(value))
+    if isinstance(value, str):
+        normalized = " ".join(value.strip().lower().split())
+        return ("string", normalized)
+    return ("json", json.dumps(value, sort_keys=True, ensure_ascii=False))
+
+
+def _majority_vote_v41(values: list):
+    """
+    Return (consensus, top_count, vote_counts, has_majority).
+
+    A true five-run majority requires at least 3 agreeing observations. When no
+    value reaches 3/5, consensus is None so downstream logic treats the field as
+    unresolved rather than arbitrarily breaking a 2-2-1 split.
+    """
+    groups = {}
+    representatives = {}
+    order = []
+    for value in values:
+        key = _repeatability_vote_key_v41(value)
+        if key not in groups:
+            groups[key] = 0
+            representatives[key] = value
+            order.append(key)
+        groups[key] += 1
+
+    ranked = sorted(order, key=lambda key: groups[key], reverse=True)
+    winner = ranked[0]
+    top_count = groups[winner]
+    has_majority = top_count >= 3
+
+    vote_counts = []
+    for key in ranked:
+        representative = representatives[key]
+        vote_counts.append(
+            {
+                "value": representative,
+                "count": groups[key],
+            }
+        )
+
+    return (
+        representatives[winner] if has_majority else None,
+        top_count,
+        vote_counts,
+        has_majority,
+    )
+
+
 def _call_structured(
     client,
     uploaded,
@@ -1421,6 +1479,127 @@ def analyze_clip_gemini(
                 pass
 
 
+
+
+
+
+def analyze_clip_gemini_v41_repeatability(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4.1 diagnostic: five independent V1 native-video observations plus majority consensus.
+
+    The clip uploads once. The same broad V1 prompt/schema is then called five times.
+    A field receives a consensus value only when at least 3 of 5 runs agree.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+        runs: list[dict] = []
+
+        for run_index in range(5):
+            chart = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _prompt(play_context),
+                FootballSnapChart,
+            )
+            run = chart.model_dump()
+            runs.append(run)
+            if run_index < 4:
+                time.sleep(2)
+
+        chart_fields = [
+            name
+            for name in FootballSnapChart.model_fields
+            if name not in {"overall_confidence", "uncertain_fields", "analysis_notes"}
+        ]
+
+        result = {}
+        stability = {}
+        no_majority_fields = []
+        unanimous_fields = []
+        strong_majority_fields = []
+
+        for field in chart_fields:
+            values = [run.get(field) for run in runs]
+            consensus, top_count, vote_counts, has_majority = _majority_vote_v41(values)
+            result[field] = consensus
+            agreement = top_count / len(runs)
+
+            stability[field] = {
+                "top_count": top_count,
+                "run_count": len(runs),
+                "agreement": agreement,
+                "has_majority": has_majority,
+                "vote_counts": vote_counts,
+            }
+
+            if top_count == len(runs):
+                unanimous_fields.append(field)
+            elif top_count >= 4:
+                strong_majority_fields.append(field)
+
+            if not has_majority:
+                no_majority_fields.append(field)
+
+        confidences = [
+            float(run["overall_confidence"])
+            for run in runs
+            if run.get("overall_confidence") is not None
+        ]
+        result["overall_confidence"] = (
+            sum(confidences) / len(confidences) if confidences else 0.0
+        )
+
+        uncertain = []
+        for run in runs:
+            for field in run.get("uncertain_fields") or []:
+                if field not in uncertain:
+                    uncertain.append(field)
+        for field in no_majority_fields:
+            if field not in uncertain:
+                uncertain.append(field)
+        result["uncertain_fields"] = uncertain
+
+        result["analysis_notes"] = (
+            "V4.1 repeatability consensus from five independent V1 native-video calls. "
+            f"{len(unanimous_fields)} chart fields were unanimous; "
+            f"{len(no_majority_fields)} had no 3-of-5 majority and were left unresolved."
+        )
+
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v4.1-repeatability"
+        result["_repeatability"] = {
+            "run_count": 5,
+            "consensus_rule": "At least 3 of 5 identical normalized values",
+            "runs": runs,
+            "stability": stability,
+            "unanimous_fields": unanimous_fields,
+            "strong_majority_fields": strong_majority_fields,
+            "no_majority_fields": no_majority_fields,
+        }
+        return result
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_gemini_v4(
