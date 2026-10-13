@@ -118,6 +118,30 @@ class RosterPersonnelPassV44(BaseModel):
     notes: str = ""
 
 
+
+
+class HybridEligiblePlayerV45(BaseModel):
+    """Eligible-player evidence combining cautious jersey reading with whole-sequence role evidence."""
+
+    player_label: str
+    jersey_number: Optional[str] = None
+    jersey_readability: Literal["Clear", "Partial", "Unreadable"]
+    visual_role: Literal["RB/FB", "TE/H-back", "WR", "Unknown"]
+    initial_alignment: str = ""
+    final_alignment: str = ""
+    identity_evidence: str = ""
+
+
+class HybridPersonnelPassV45(BaseModel):
+    """Personnel-only pass for hybrid roster/visual evidence."""
+
+    offensive_lineman_count: int = Field(ge=0, le=7)
+    quarterback_count: int = Field(ge=0, le=2)
+    eligible_players: list[HybridEligiblePlayerV45] = Field(min_length=5, max_length=5)
+    confidence: float = Field(ge=0, le=1)
+    notes: str = ""
+
+
 class NativeCorrectionV4(BaseModel):
     """Narrow second native-video pass for fields where V1 historically underperforms."""
 
@@ -559,6 +583,99 @@ IMPORTANT:
 
 
 
+
+
+
+
+def _hybrid_personnel_prompt_v45(play_context: dict) -> str:
+    context = _context(play_context)
+    roster = play_context.get("offense_skill_roster") or []
+    roster_reference = [
+        {
+            "jersey": item.get("jersey"),
+            "name": item.get("name"),
+        }
+        for item in roster
+    ]
+    return f"""
+You are doing ONLY offensive personnel identification for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Offensive skill-player roster reference (jersey and name only):
+{json.dumps(roster_reference, indent=2)}
+
+Your job is to account for the offense and collect TWO INDEPENDENT kinds of evidence for each
+eligible player:
+1) jersey-number evidence, when the number is genuinely readable;
+2) whole-sequence football-role evidence.
+
+Do NOT chart formation, motion, play type, defense, pressure, or coverage in this pass.
+
+STEP 1 — TRUE OFFENSIVE LINEMEN
+Identify/count the five true offensive linemen: LT, LG, C, RG, RT.
+Return offensive_lineman_count.
+A WR who is on the line of scrimmage is not an offensive lineman.
+
+STEP 2 — QUARTERBACK
+Identify/count the quarterback and return quarterback_count.
+
+STEP 3 — EXACTLY FIVE ELIGIBLE PLAYERS
+Return exactly five eligible_players. Track the SAME five players through the entire pre-snap
+sequence, even if one shifts or motions.
+
+For each player return:
+
+player_label:
+- generic visual identity such as "back beside QB", "boundary WR", "field slot", "attached player".
+
+jersey_number:
+- return digits only when actually visible;
+- otherwise null.
+- Do NOT choose a jersey merely because a roster number seems plausible.
+
+jersey_readability:
+- Clear = the digits are genuinely readable from the video;
+- Partial = you can see some number evidence but not enough to trust the full number;
+- Unreadable = the number cannot be responsibly identified.
+Be conservative. A guessed number is Unreadable, not Clear.
+
+visual_role:
+- RB/FB
+- TE/H-back
+- WR
+- Unknown
+
+IMPORTANT ROLE RULE:
+Determine visual_role from the player's WHOLE pre-snap sequence, with extra weight on the
+EARLIEST SETTLED ALIGNMENT before any shift or motion. Final alignment alone does NOT change
+personnel identity.
+
+Examples:
+- A player who begins beside/behind the QB as a back, then shifts wide, remains RB/FB.
+- A TE/H-back who begins attached/wing/core and later flexes out remains TE/H-back.
+- A player who begins split wide/slot and functions as a receiver should remain WR even if a
+  guessed jersey number would map to a different roster position.
+- Do not call a wide receiver an RB merely because a roster lookup might suggest that jersey.
+- If the visual identity itself is not supportable, return Unknown.
+
+initial_alignment:
+Describe where that player is in the earliest settled offensive picture.
+
+final_alignment:
+Describe where the same player is immediately before the snap.
+
+identity_evidence:
+Briefly explain WHY the visual_role was chosen, especially when initial and final alignment differ.
+
+CRITICAL:
+Jersey reading and visual_role are independent evidence streams. Do not force them to agree.
+Python will decide how to reconcile them:
+- a truly Clear jersey can use roster identity;
+- unreadable/partial jerseys fall back to visual role;
+- a Clear jersey that conflicts with a known visual role is flagged for review rather than forced.
+"""
 
 
 def _roster_personnel_prompt_v44(play_context: dict) -> str:
@@ -1571,6 +1688,128 @@ def _normalize_jersey_v44(value) -> Optional[str]:
         return None
 
 
+
+
+def _derive_hybrid_personnel_v45(
+    personnel_pass: HybridPersonnelPassV45,
+    roster: list[dict],
+) -> tuple[str, dict]:
+    """
+    Resolve each eligible player's role using an evidence hierarchy.
+
+    Clear jersey + unique roster role is trusted only when it does not conflict with
+    an independently observed visual role. Partial/unreadable jerseys never drive role
+    assignment; they fall back to whole-sequence visual identity.
+    """
+    by_jersey: dict[str, list[dict]] = {}
+    for item in roster:
+        jersey = _normalize_jersey_v44(item.get("jersey"))
+        role = item.get("role")
+        if jersey and role in {"RB/FB", "TE/H-back", "WR"}:
+            by_jersey.setdefault(jersey, []).append(item)
+
+    resolved_players = []
+    clear_jerseys = []
+
+    for visible in personnel_pass.eligible_players:
+        jersey = _normalize_jersey_v44(visible.jersey_number)
+        readability = visible.jersey_readability
+        visual_role = visible.visual_role
+        matches = by_jersey.get(jersey, []) if jersey else []
+        roster_roles = sorted({item.get("role") for item in matches if item.get("role")})
+        roster_role = roster_roles[0] if len(roster_roles) == 1 else None
+
+        matched_name = matches[0].get("name") if len(matches) == 1 else None
+        matched_position = matches[0].get("position") if len(matches) == 1 else None
+
+        resolved_role = "Unknown"
+        source = "unresolved"
+        conflict = False
+
+        if readability == "Clear":
+            if jersey:
+                clear_jerseys.append(jersey)
+
+            if roster_role:
+                if visual_role not in {"Unknown", roster_role}:
+                    # Strong evidence streams disagree: do not force a package.
+                    conflict = True
+                    source = "jersey-visual-conflict"
+                else:
+                    resolved_role = roster_role
+                    source = "clear-jersey+roster"
+            else:
+                source = "clear-jersey-no-unique-roster-match"
+        else:
+            # Partial/unreadable digits cannot override football-role evidence.
+            if visual_role != "Unknown":
+                resolved_role = visual_role
+                source = "whole-sequence-visual-role"
+            else:
+                source = "no-trustworthy-evidence"
+
+        resolved_players.append(
+            {
+                "player_label": visible.player_label,
+                "jersey": jersey,
+                "jersey_readability": readability,
+                "visual_role": visual_role,
+                "roster_role": roster_role,
+                "resolved_role": resolved_role,
+                "resolution_source": source,
+                "conflict": conflict,
+                "matched_name": matched_name,
+                "roster_position": matched_position,
+                "roster_match_count": len(matches),
+                "initial_alignment": visible.initial_alignment,
+                "final_alignment": visible.final_alignment,
+                "identity_evidence": visible.identity_evidence,
+            }
+        )
+
+    roles = [item["resolved_role"] for item in resolved_players]
+    rb_count = sum(role == "RB/FB" for role in roles)
+    te_count = sum(role == "TE/H-back" for role in roles)
+    wr_count = sum(role == "WR" for role in roles)
+    unknown_count = sum(role == "Unknown" for role in roles)
+    conflict_count = sum(bool(item["conflict"]) for item in resolved_players)
+    duplicate_clear_jerseys = len(clear_jerseys) != len(set(clear_jerseys))
+
+    valid_accounting = (
+        personnel_pass.offensive_lineman_count == 5
+        and personnel_pass.quarterback_count == 1
+        and len(resolved_players) == 5
+        and unknown_count == 0
+        and conflict_count == 0
+        and not duplicate_clear_jerseys
+        and (rb_count + te_count + wr_count) == 5
+    )
+
+    if valid_accounting:
+        code = f"{rb_count}{te_count}"
+        standard = {"00", "01", "02", "10", "11", "12", "13", "20", "21", "22", "23", "30", "31", "32"}
+        personnel = code if code in standard else "Other"
+    else:
+        personnel = "Unknown"
+
+    audit = {
+        "offensive_lineman_count": personnel_pass.offensive_lineman_count,
+        "quarterback_count": personnel_pass.quarterback_count,
+        "eligible_player_count": len(resolved_players),
+        "rb_fb_count": rb_count,
+        "te_hback_count": te_count,
+        "wr_count": wr_count,
+        "unknown_eligible_count": unknown_count,
+        "conflict_count": conflict_count,
+        "duplicate_clear_jerseys": duplicate_clear_jerseys,
+        "valid_accounting": valid_accounting,
+        "eligible_players": resolved_players,
+        "notes": personnel_pass.notes,
+        "confidence": personnel_pass.confidence,
+    }
+    return personnel, audit
+
+
 def _derive_roster_personnel_v44(
     personnel_pass: RosterPersonnelPassV44,
     roster: list[dict],
@@ -1896,6 +2135,188 @@ def analyze_clip_gemini(
 
 
 
+
+
+
+
+def analyze_clip_gemini_v45_hybrid_personnel(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4.5: five unchanged V1 full-chart calls plus three hybrid personnel-evidence calls.
+
+    Personnel uses clear jersey+roster identity when trustworthy, otherwise whole-sequence
+    visual role. Conflicting strong evidence is left Unknown/review rather than forced.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    roster = play_context.get("offense_skill_roster") or []
+    if not roster:
+        raise ValueError("V4.5 requires an offensive skill-player roster in play_context.")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        # Preserve V4.4/V4.1 full-chart behavior exactly.
+        full_runs: list[dict] = []
+        for run_index in range(5):
+            chart = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _prompt(play_context),
+                FootballSnapChart,
+            )
+            full_runs.append(chart.model_dump())
+            if run_index < 4:
+                time.sleep(2)
+
+        chart_fields = [
+            name
+            for name in FootballSnapChart.model_fields
+            if name not in {"overall_confidence", "uncertain_fields", "analysis_notes"}
+        ]
+
+        result = {}
+        stability = {}
+        no_majority_fields = []
+        unanimous_fields = []
+        strong_majority_fields = []
+
+        for field in chart_fields:
+            values = [run.get(field) for run in full_runs]
+            consensus, top_count, vote_counts, has_majority = _majority_vote_v41(values)
+            result[field] = consensus
+            stability[field] = {
+                "top_count": top_count,
+                "run_count": len(full_runs),
+                "agreement": top_count / len(full_runs),
+                "has_majority": has_majority,
+                "vote_counts": vote_counts,
+                "source": "v1-full-chart",
+            }
+            if top_count == len(full_runs):
+                unanimous_fields.append(field)
+            elif top_count >= 4:
+                strong_majority_fields.append(field)
+            if not has_majority:
+                no_majority_fields.append(field)
+
+        personnel_runs = []
+        personnel_audits = []
+        for run_index in range(3):
+            personnel_pass = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _hybrid_personnel_prompt_v45(play_context),
+                HybridPersonnelPassV45,
+            )
+            personnel, audit = _derive_hybrid_personnel_v45(personnel_pass, roster)
+            personnel_runs.append(personnel)
+            personnel_audits.append(audit)
+            if run_index < 2:
+                time.sleep(2)
+
+        _, personnel_top_count, personnel_votes, _ = _majority_vote_v41(personnel_runs)
+        if personnel_top_count >= 2 and personnel_votes:
+            personnel_consensus = personnel_votes[0]["value"]
+            personnel_has_majority = True
+        else:
+            personnel_consensus = None
+            personnel_has_majority = False
+
+        result["personnel"] = personnel_consensus
+        stability["personnel"] = {
+            "top_count": personnel_top_count,
+            "run_count": 3,
+            "agreement": personnel_top_count / 3,
+            "has_majority": personnel_has_majority,
+            "vote_counts": personnel_votes,
+            "source": "hybrid-personnel-evidence",
+        }
+
+        if "personnel" in no_majority_fields:
+            no_majority_fields.remove("personnel")
+        if not personnel_has_majority or result.get("personnel") in {None, "Unknown"}:
+            no_majority_fields.append("personnel")
+
+        confidences = [
+            float(run["overall_confidence"])
+            for run in full_runs
+            if run.get("overall_confidence") is not None
+        ]
+        result["overall_confidence"] = (
+            sum(confidences) / len(confidences) if confidences else 0.0
+        )
+
+        uncertain = []
+        for run in full_runs:
+            for field in run.get("uncertain_fields") or []:
+                if field not in uncertain:
+                    uncertain.append(field)
+        for field in no_majority_fields:
+            if field not in uncertain:
+                uncertain.append(field)
+        if result.get("personnel") in {None, "Unknown"} and "personnel" not in uncertain:
+            uncertain.append("personnel")
+        result["uncertain_fields"] = uncertain
+
+        valid_personnel_runs = sum(
+            bool(audit.get("valid_accounting")) for audit in personnel_audits
+        )
+        conflict_runs = sum(
+            int(audit.get("conflict_count", 0) > 0) for audit in personnel_audits
+        )
+
+        result["analysis_notes"] = (
+            "V4.5 uses five unchanged V1 full-chart calls plus three hybrid personnel calls. "
+            f"{valid_personnel_runs}/3 personnel runs produced complete accounting; "
+            f"{conflict_runs}/3 had at least one clear-jersey vs visual-role conflict."
+        )
+
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v4.5-hybrid-personnel"
+        result["_repeatability"] = {
+            "run_count": 5,
+            "consensus_rule": "At least 3 of 5 identical values for full-chart fields",
+            "runs": full_runs,
+            "stability": stability,
+            "unanimous_fields": unanimous_fields,
+            "strong_majority_fields": strong_majority_fields,
+            "no_majority_fields": no_majority_fields,
+        }
+        result["_personnel_accounting"] = {
+            "method": "Clear jersey+roster when corroborated; otherwise whole-sequence visual role; conflicts -> review",
+            "run_count": 3,
+            "consensus_rule": "At least 2 of 3 derived personnel codes",
+            "valid_runs": valid_personnel_runs,
+            "conflict_runs": conflict_runs,
+            "personnel_runs": personnel_runs,
+            "votes": personnel_votes,
+            "roster": roster,
+            "runs": personnel_audits,
+        }
+        return result
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_gemini_v44_roster_personnel(
