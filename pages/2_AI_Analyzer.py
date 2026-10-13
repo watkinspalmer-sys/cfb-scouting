@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass
 
 
 ANALYZERS = {
-    "V4.2 repeatability + mechanical personnel (recommended)": ("v4.2-mechanical-personnel-repeatability", analyze_clip_gemini_v42_personnel_repeatability),
+    "V4.3 repeatability + separate personnel pass (recommended)": ("v4.3-repeatability-separated-personnel", analyze_clip_gemini_v43_repeatability_with_personnel_pass),
+    "V4.2 repeatability + mechanical personnel": ("v4.2-mechanical-personnel-repeatability", analyze_clip_gemini_v42_personnel_repeatability),
     "V4.1 repeatability diagnostic — 5x V1": ("v4.1-repeatability", analyze_clip_gemini_v41_repeatability),
     "V4 native video + corrective pass": ("v4-native-corrective", analyze_clip_gemini_v4),
     "V3.4 snap-centered temporal": ("v3.4-snap-centered", analyze_clip_gemini_v34),
@@ -231,7 +232,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+            if analyzer_version == "v4.3-repeatability-separated-personnel":
+                passes = "five full-chart V1 observations plus three personnel-only observations"
+            elif analyzer_version == "v4.2-mechanical-personnel-repeatability":
                 passes = "five native-video observations with mechanical personnel accounting"
             elif analyzer_version == "v4.1-repeatability":
                 passes = "five independent V1 native-video observations"
@@ -283,7 +286,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -292,7 +295,83 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+        if analyzer_version == "v4.3-repeatability-separated-personnel":
+            st.caption(
+                "V4.3 separates the jobs completely: five unchanged V1 calls chart the whole snap, "
+                "while three personnel-only calls perform 5 OL + 1 QB + 5 eligible-player accounting. "
+                "Only the personnel field is replaced by the personnel pass."
+            )
+            repeatability = prediction.get("_repeatability") or {}
+            personnel = prediction.get("_personnel_accounting") or {}
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("Full-chart runs", repeatability.get("run_count", 5))
+            x2.metric("Personnel-only runs", personnel.get("run_count", 3))
+            x3.metric("Valid personnel runs", f"{personnel.get('valid_runs', 0)}/3")
+            x4.metric("Consensus personnel", prediction.get("personnel", "—"))
+
+            full_runs = repeatability.get("runs") or []
+            if full_runs:
+                full_rows = []
+                for run_index, run in enumerate(full_runs, start=1):
+                    run_comp = compare_prediction(human.to_dict(), run)
+                    run_matches, run_total, run_accuracy = score_prediction(run_comp)
+                    full_rows.append(
+                        {
+                            "Run": run_index,
+                            "Matches": run_matches,
+                            "Scored fields": run_total,
+                            "Accuracy": run_accuracy,
+                            "Model confidence": run.get("overall_confidence"),
+                        }
+                    )
+                full_df = pd.DataFrame(full_rows)
+                full_display = full_df.copy()
+                full_display["Accuracy"] = full_display["Accuracy"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                full_display["Model confidence"] = full_display["Model confidence"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                st.write("**Five unchanged V1 full-chart runs**")
+                st.dataframe(full_display, hide_index=True, use_container_width=True)
+
+            personnel_runs = personnel.get("runs") or []
+            if personnel_runs:
+                audit_rows = []
+                for run_index, audit in enumerate(personnel_runs, start=1):
+                    audit_rows.append(
+                        {
+                            "Personnel run": run_index,
+                            "Derived personnel": (personnel.get("personnel_runs") or [None, None, None])[run_index - 1],
+                            "OL": audit.get("offensive_lineman_count"),
+                            "QB": audit.get("quarterback_count"),
+                            "RB/FB": audit.get("rb_fb_count"),
+                            "TE/H": audit.get("te_hback_count"),
+                            "WR": audit.get("wr_count"),
+                            "Unknown": audit.get("unknown_eligible_count"),
+                            "Valid": audit.get("valid_accounting"),
+                            "Confidence": audit.get("confidence"),
+                        }
+                    )
+                st.write("**Separate mechanical personnel runs**")
+                st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
+
+                with st.expander("View eligible-player classifications from personnel pass"):
+                    for run_index, audit in enumerate(personnel_runs, start=1):
+                        st.write(f"**Personnel run {run_index}**")
+                        st.dataframe(
+                            pd.DataFrame(audit.get("eligible_players") or []),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+            votes = personnel.get("votes") or []
+            if votes:
+                st.write(
+                    "**Personnel votes:**",
+                    " | ".join(f"{item.get('value')}: {item.get('count')}/3" for item in votes),
+                )
+        elif analyzer_version == "v4.2-mechanical-personnel-repeatability":
             st.caption(
                 "V4.2 keeps the five-run repeatability test but replaces direct personnel guessing "
                 "with player accounting: 5 OL + 1 QB + exactly 5 eligible skill players. Each eligible "
@@ -963,7 +1042,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4.2-mechanical-personnel-repeatability":
+    if analyzer_version == "v4.3-repeatability-separated-personnel":
+        st.info(
+            "V4.3 is a SINGLE-SNAP diagnostic. It uses 5 normal V1 full-chart calls plus 3 separate "
+            "personnel-only calls against one uploaded video. The personnel prompt cannot affect any "
+            "formation, movement, play, defense, or pressure field."
+        )
+    elif analyzer_version == "v4.2-mechanical-personnel-repeatability":
         st.info(
             "V4.2 is a SINGLE-SNAP diagnostic. It makes five native-video calls, but personnel is "
             "never accepted directly from Gemini. Each run must account for 5 OL + 1 QB + 5 eligible "
@@ -1039,7 +1124,7 @@ def _render_batch(
         bool(use_play_text),
     )
 
-    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
+    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
         st.warning(
             "Repeatability diagnostics are intentionally disabled in Batch benchmark. Run this "
             "version from the Single snap tab on Play 1 first; five observations of one snap are "
@@ -1162,7 +1247,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -1229,8 +1314,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.2 tests repeatability while deriving offensive personnel from explicit 5 OL + 1 QB + "
-        "5 eligible-player accounting instead of asking Gemini to recognize personnel shorthand."
+        "V4.3 keeps full-snap charting and mechanical personnel accounting in separate model calls, "
+        "so improving personnel cannot suppress or overwrite the rest of the scouting chart."
     )
 
     chart = load_film_chart()
@@ -1253,7 +1338,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4.2 on a single snap to test mechanical personnel accounting plus five-run repeatability. Older analyzers remain available as baselines.",
+        help="Use V4.3 on a single snap to test five-run V1 repeatability plus an isolated mechanical personnel pass. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
