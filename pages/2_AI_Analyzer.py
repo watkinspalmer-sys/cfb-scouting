@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability
 
 
 ANALYZERS = {
-    "V4 native video + corrective pass (recommended)": ("v4-native-corrective", analyze_clip_gemini_v4),
+    "V4.1 repeatability diagnostic — 5x V1 (recommended)": ("v4.1-repeatability", analyze_clip_gemini_v41_repeatability),
+    "V4 native video + corrective pass": ("v4-native-corrective", analyze_clip_gemini_v4),
     "V3.4 snap-centered temporal": ("v3.4-snap-centered", analyze_clip_gemini_v34),
     "V3.3 two-pass temporal": ("v3.3-two-pass-temporal", analyze_clip_gemini_v33),
     "V3.2 temporal diagnostic 1-pass": ("v3.2-temporal-diagnostic", analyze_clip_gemini_v32_diagnostic),
@@ -229,7 +230,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4-native-corrective":
+            if analyzer_version == "v4.1-repeatability":
+                passes = "five independent V1 native-video observations"
+            elif analyzer_version == "v4-native-corrective":
                 passes = "two native-video passes"
             elif analyzer_version == "v3.4-snap-centered":
                 passes = "three snap-centered temporal passes"
@@ -277,7 +280,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -286,7 +289,125 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v4-native-corrective":
+        if analyzer_version == "v4.1-repeatability":
+            st.caption(
+                "V4.1 is a repeatability diagnostic. It uploads the clip once, then asks the same "
+                "V1 native-video charting question five independent times. The displayed prediction "
+                "is a 3-of-5 majority consensus; fields without a true majority are left unresolved."
+            )
+            repeatability = prediction.get("_repeatability") or {}
+            runs = repeatability.get("runs") or []
+            stability = repeatability.get("stability") or {}
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Independent V1 runs", repeatability.get("run_count", len(runs)))
+            unanimous = repeatability.get("unanimous_fields") or []
+            strong = repeatability.get("strong_majority_fields") or []
+            unresolved = repeatability.get("no_majority_fields") or []
+            r2.metric("Unanimous fields", len(unanimous))
+            r3.metric("4/5 majority fields", len(strong))
+            r4.metric("No majority", len(unresolved))
+
+            if runs:
+                run_rows = []
+                for run_index, run in enumerate(runs, start=1):
+                    run_comp = compare_prediction(human.to_dict(), run)
+                    run_matches, run_total, run_accuracy = score_prediction(run_comp)
+                    run_rows.append(
+                        {
+                            "Run": run_index,
+                            "Matches": run_matches,
+                            "Scored fields": run_total,
+                            "Accuracy": run_accuracy,
+                            "Model confidence": run.get("overall_confidence"),
+                        }
+                    )
+                run_df = pd.DataFrame(run_rows)
+                run_display = run_df.copy()
+                run_display["Accuracy"] = run_display["Accuracy"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                run_display["Model confidence"] = run_display["Model confidence"].map(
+                    lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                )
+                st.write("**Individual V1 run performance**")
+                st.dataframe(run_display, hide_index=True, use_container_width=True)
+
+            if stability:
+                comparison_for_labels = compare_prediction(human.to_dict(), prediction)
+                category_by_field = dict(
+                    zip(comparison_for_labels["Field"], comparison_for_labels["Category"])
+                )
+                ai_key_by_label = {
+                    "Personnel": "personnel",
+                    "Formation family": "formation_family",
+                    "Initial receiver structure": "initial_formation",
+                    "Initial backfield": "initial_backfield",
+                    "Receiver structure at snap": "final_formation",
+                    "Backfield at snap": "final_backfield",
+                    "Formation strength": "formation_strength",
+                    "Motion present": "motion_present",
+                    "Motion type": "motion_type",
+                    "Shift present": "shift_present",
+                    "Film play type": "film_play_type",
+                    "Run direction": "run_direction",
+                    "RPO": "rpo",
+                    "Play action": "play_action",
+                    "Defensive personnel": "defensive_personnel",
+                    "Front": "front",
+                    "Initial box count": "initial_box_count",
+                    "Box count at snap": "snap_box_count",
+                    "Shell": "shell",
+                    "Rushers": "rushers",
+                    "Blitz": "blitz",
+                    "Pressure family": "pressure_family",
+                    "Adjustment trigger": "adjustment_trigger",
+                    "Adjustment type": "adjustment_type",
+                }
+                stability_rows = []
+                for label, ai_key in ai_key_by_label.items():
+                    info = stability.get(ai_key)
+                    if not info:
+                        continue
+                    votes = info.get("vote_counts") or []
+                    vote_text = " | ".join(
+                        f"{item.get('value')}: {item.get('count')}/5" for item in votes
+                    )
+                    stability_rows.append(
+                        {
+                            "Category": category_by_field.get(label, ""),
+                            "Field": label,
+                            "Consensus": prediction.get(ai_key),
+                            "Agreement": info.get("agreement"),
+                            "Majority": info.get("has_majority"),
+                            "Votes": vote_text,
+                        }
+                    )
+                stability_df = pd.DataFrame(stability_rows)
+                if not stability_df.empty:
+                    stability_display = stability_df.copy()
+                    stability_display["Agreement"] = stability_display["Agreement"].map(
+                        lambda value: f"{value:.0%}" if pd.notna(value) else ""
+                    )
+                    st.write("**Field stability across five identical V1 calls**")
+                    st.dataframe(
+                        stability_display,
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    st.download_button(
+                        "Download V4.1 repeatability field stability CSV",
+                        data=stability_df.to_csv(index=False).encode("utf-8"),
+                        file_name="v4.1_repeatability_field_stability.csv",
+                        mime="text/csv",
+                        key="download_v41_stability",
+                    )
+
+            if unresolved:
+                st.warning(
+                    "No 3-of-5 majority: " + ", ".join(unresolved)
+                )
+        elif analyzer_version == "v4-native-corrective":
             st.caption(
                 "V4 keeps the V1 native-video chart as the foundation, then runs one narrow "
                 "native-video correction pass. Only personnel, initial/final receiver structure, "
@@ -762,7 +883,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4-native-corrective":
+    if analyzer_version == "v4.1-repeatability":
+        st.info(
+            "V4.1 is a SINGLE-SNAP diagnostic. It makes five independent V1 chart calls against "
+            "one uploaded clip and scores a 3-of-5 consensus. Do not use Batch benchmark for this "
+            "version; that would multiply the experiment across every reviewed snap."
+        )
+    elif analyzer_version == "v4-native-corrective":
         st.info(
             "V4 uploads the clip once and makes 2 native-video Gemini calls: the original broad "
             "V1 chart plus a narrow corrective pass for only the historically weak offensive "
@@ -825,6 +952,13 @@ def _render_batch(
         float(video_fps),
         bool(use_play_text),
     )
+
+    if analyzer_version == "v4.1-repeatability":
+        st.warning(
+            "V4.1 is intentionally disabled in Batch benchmark. Run it from the Single snap tab "
+            "on Play 1 first; five observations of one snap are enough to measure repeatability."
+        )
+        return
 
     run_batch = st.button(
         f"Run all {len(eligible)} plays with {analyzer_label}",
@@ -941,7 +1075,7 @@ def _render_batch(
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
     baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    if analyzer_version in {"v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -1008,8 +1142,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4 uses the proven V1 native-video chart as its foundation, then adds one narrow "
-        "native-video corrective pass for historically weak offensive structure fields."
+        "V4.1 tests whether repeated native-video observations are more reliable than increasingly "
+        "complex specialist pipelines by running the same V1 analysis five times and taking a true majority."
     )
 
     chart = load_film_chart()
@@ -1032,7 +1166,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4 for the current native-video corrective benchmark. Older analyzers remain available as baselines.",
+        help="Use V4.1 on a single snap to measure V1 repeatability and majority-vote accuracy. Older analyzers remain available as baselines.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
