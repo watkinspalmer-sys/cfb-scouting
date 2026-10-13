@@ -72,3 +72,43 @@ def fetch_plays(team, year, last_week, api_key):
         return pd.DataFrame()
 
     return pd.concat(frames, ignore_index=True)
+
+
+def _roster_cache_path(team, year):
+    safe_team = re.sub(r"[^A-Za-z0-9_-]+", "_", str(team).strip())
+    return CACHE_DIR / f"roster_{safe_team}_{int(year)}.json"
+
+
+def fetch_roster(team, year, api_key, use_cache=True):
+    """Load one team's season roster, preferring a persistent local cache."""
+    cache_path = _roster_cache_path(team, year)
+
+    if use_cache and cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return pd.DataFrame(data)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    response = requests.get(
+        f"{BASE}/roster",
+        headers={"Authorization": f"Bearer {api_key}"},
+        params={"team": team, "year": int(year)},
+        timeout=60,
+    )
+    if response.status_code == 401:
+        raise ValueError("The API key was rejected (401). Check the key in your app secrets.")
+    if response.status_code == 429:
+        raise ValueError("You have used up your monthly request allowance (429).")
+
+    response.raise_for_status()
+    data = response.json()
+
+    if use_cache:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    return pd.DataFrame(data)
+
