@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_roster, fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel, analyze_clip_gemini_v46_personnel_consensus
 
 
 ANALYZERS = {
-    "V4.5 hybrid personnel evidence (recommended)": ("v4.5-hybrid-personnel", analyze_clip_gemini_v45_hybrid_personnel),
+    "V4.6 deterministic personnel consensus (recommended)": ("v4.6-personnel-consensus", analyze_clip_gemini_v46_personnel_consensus),
+    "V4.5 hybrid personnel evidence": ("v4.5-hybrid-personnel", analyze_clip_gemini_v45_hybrid_personnel),
     "V4.4 roster-assisted personnel": ("v4.4-roster-assisted-personnel", analyze_clip_gemini_v44_roster_personnel),
     "V4.3 repeatability + separate personnel pass": ("v4.3-repeatability-separated-personnel", analyze_clip_gemini_v43_repeatability_with_personnel_pass),
     "V4.2 repeatability + mechanical personnel": ("v4.2-mechanical-personnel-repeatability", analyze_clip_gemini_v42_personnel_repeatability),
@@ -350,7 +351,9 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4.5-hybrid-personnel":
+            if analyzer_version == "v4.6-personnel-consensus":
+                passes = "five full-chart V1 observations plus three visual-role personnel observations"
+            elif analyzer_version == "v4.5-hybrid-personnel":
                 passes = "five full-chart V1 observations plus three hybrid personnel-evidence observations"
             elif analyzer_version == "v4.4-roster-assisted-personnel":
                 passes = "five full-chart V1 observations plus three roster-assisted jersey-ID observations"
@@ -378,7 +381,7 @@ def _render_single(
                 passes = "one native-video pass"
             with st.spinner(f"Analyzing with {passes} using {model} at {video_fps:.1f} FPS..."):
                 extra_context = None
-                if analyzer_version in {"v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel"}:
+                if analyzer_version in {"v4.6-personnel-consensus", "v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel"}:
                     extra_context = _v44_roster_context(human, cfbd_key)
                 prediction = _run_analyzer(
                     analyzer_fn, clip_path, human, role.lower(), use_play_text,
@@ -411,7 +414,7 @@ def _render_single(
     )
     st.caption(f"Prediction saved locally to {saved_path}.")
 
-    if analyzer_version in {"v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
+    if analyzer_version in {"v4.6-personnel-consensus", "v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"}:
         derived = prediction.get("_derived") or {}
         pass_conf = prediction.get("_pass_confidence") or {}
         d1, d2, d3, d4 = st.columns(4)
@@ -420,7 +423,72 @@ def _render_single(
         d2.metric("Observed TEs", derived.get("te_count", "—"))
         d3.metric("Derived personnel", prediction.get("personnel", "—"))
         d4.metric("Derived blitz", str(prediction.get("blitz", "—")))
-        if analyzer_version == "v4.5-hybrid-personnel":
+        if analyzer_version == "v4.6-personnel-consensus":
+            st.caption(
+                "V4.6 preserves five unchanged V1 full-chart calls, then runs three personnel-only "
+                "visual-role observations. Each specialist run derives personnel from the five visual "
+                "roles only; Python takes a true 2-of-3 vote. Jersey/roster evidence is diagnostic and "
+                "can no longer override the football-role count."
+            )
+            repeatability = prediction.get("_repeatability") or {}
+            personnel = prediction.get("_personnel_accounting") or {}
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Full-chart runs", repeatability.get("run_count", 5))
+            q2.metric("Personnel runs", personnel.get("run_count", 3))
+            q3.metric("Valid personnel runs", f"{personnel.get('valid_runs', 0)}/3")
+            q4.metric("Consensus personnel", prediction.get("personnel", "—"))
+
+            derived_runs = personnel.get("personnel_runs") or []
+            audits = personnel.get("runs") or []
+            if audits:
+                rows = []
+                for run_index, audit in enumerate(audits, start=1):
+                    rows.append(
+                        {
+                            "Run": run_index,
+                            "Personnel": derived_runs[run_index - 1] if run_index - 1 < len(derived_runs) else None,
+                            "OL": audit.get("offensive_lineman_count"),
+                            "QB": audit.get("quarterback_count"),
+                            "RB/FB": audit.get("rb_fb_count"),
+                            "TE/H": audit.get("te_hback_count"),
+                            "WR": audit.get("wr_count"),
+                            "Unknown": audit.get("unknown_eligible_count"),
+                            "Valid": audit.get("valid_accounting"),
+                        }
+                    )
+                st.write("**Three visual personnel runs**")
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+                with st.expander("View player-role observations"):
+                    for run_index, audit in enumerate(audits, start=1):
+                        st.write(f"**Personnel run {run_index}**")
+                        st.dataframe(
+                            pd.DataFrame(audit.get("eligible_players") or []),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+            votes = personnel.get("votes") or []
+            if votes:
+                st.write(
+                    "**Personnel votes:**",
+                    " | ".join(f"{item.get('value')}: {item.get('count')}/3" for item in votes),
+                )
+
+            jersey = personnel.get("jersey_corroboration") or []
+            if jersey:
+                with st.expander("Jersey corroboration diagnostics (does not affect personnel)"):
+                    jersey_rows = []
+                    for item in jersey:
+                        jersey_rows.append(
+                            {
+                                "Initial slot": item.get("initial_slot"),
+                                "Corroborated jersey": item.get("corroborated_jersey"),
+                                "Clear jersey votes": item.get("clear_jersey_votes"),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(jersey_rows), hide_index=True, use_container_width=True)
+        elif analyzer_version == "v4.5-hybrid-personnel":
             st.caption(
                 "V4.5 keeps five unchanged V1 full-chart calls, then runs three isolated personnel "
                 "passes that collect both jersey evidence and whole-sequence visual-role evidence. "
@@ -1277,7 +1345,13 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4.5-hybrid-personnel":
+    if analyzer_version == "v4.6-personnel-consensus":
+        st.info(
+            "V4.6 is a SINGLE-SNAP diagnostic. It keeps five unchanged V1 full-chart calls and uses "
+            "three separate personnel passes. Final personnel is a deterministic 2-of-3 vote on visual "
+            "RB/TE/WR counts; jersey reads are kept only for diagnostics."
+        )
+    elif analyzer_version == "v4.5-hybrid-personnel":
         st.info(
             "V4.5 is a SINGLE-SNAP diagnostic. It preserves the five-run full chart and uses three "
             "separate hybrid personnel passes. Jersey numbers are trusted only when genuinely clear; "
@@ -1371,7 +1445,7 @@ def _render_batch(
         bool(use_play_text),
     )
 
-    if analyzer_version in {"v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
+    if analyzer_version in {"v4.6-personnel-consensus", "v4.5-hybrid-personnel", "v4.4-roster-assisted-personnel", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability"}:
         st.warning(
             "Repeatability diagnostics are intentionally disabled in Batch benchmark. Run this "
             "version from the Single snap tab on Play 1 first; five observations of one snap are "
@@ -1561,8 +1635,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.5 keeps full-snap charting separate from personnel identification and combines cautious "
-        "jersey+roster evidence with whole-sequence football-role evidence instead of forcing either one."
+        "V4.6 keeps full-snap charting separate from personnel and derives the package from a "
+        "deterministic 2-of-3 consensus of three whole-sequence visual-role observations."
     )
 
     chart = load_film_chart()
@@ -1585,7 +1659,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4.5 on a single snap to test hybrid personnel evidence while preserving five-run V1 repeatability for the rest of the chart.",
+        help="Use V4.6 on a single snap to test deterministic three-run personnel consensus while preserving five-run V1 repeatability for the rest of the chart.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
