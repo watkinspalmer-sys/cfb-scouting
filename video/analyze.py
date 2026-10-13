@@ -142,6 +142,42 @@ class HybridPersonnelPassV45(BaseModel):
     notes: str = ""
 
 
+
+
+class ConsensusEligiblePlayerV46(BaseModel):
+    """Eligible-player observation for deterministic visual-role consensus."""
+
+    player_label: str
+    initial_slot: Literal[
+        "Backfield 1",
+        "Backfield 2",
+        "Left wide",
+        "Left slot",
+        "Left core/attached",
+        "Right core/attached",
+        "Right slot",
+        "Right wide",
+        "Other",
+        "Unknown",
+    ]
+    jersey_number: Optional[str] = None
+    jersey_readability: Literal["Clear", "Partial", "Unreadable"]
+    visual_role: Literal["RB/FB", "TE/H-back", "WR", "Unknown"]
+    initial_alignment: str = ""
+    final_alignment: str = ""
+    identity_evidence: str = ""
+
+
+class PersonnelConsensusPassV46(BaseModel):
+    """Personnel-only pass for deterministic three-run role consensus."""
+
+    offensive_lineman_count: int = Field(ge=0, le=7)
+    quarterback_count: int = Field(ge=0, le=2)
+    eligible_players: list[ConsensusEligiblePlayerV46] = Field(min_length=5, max_length=5)
+    confidence: float = Field(ge=0, le=1)
+    notes: str = ""
+
+
 class NativeCorrectionV4(BaseModel):
     """Narrow second native-video pass for fields where V1 historically underperforms."""
 
@@ -585,6 +621,89 @@ IMPORTANT:
 
 
 
+
+
+
+
+def _personnel_consensus_prompt_v46(play_context: dict) -> str:
+    context = _context(play_context)
+    roster = play_context.get("offense_skill_roster") or []
+    roster_reference = [
+        {
+            "jersey": item.get("jersey"),
+            "name": item.get("name"),
+        }
+        for item in roster
+    ]
+    return f"""
+You are doing ONLY offensive personnel identification for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Optional offensive skill-player roster reference (jersey and name only):
+{json.dumps(roster_reference, indent=2)}
+
+IMPORTANT:
+The FINAL personnel package will be derived in Python from three independent visual-role counts.
+Jersey numbers are only corroborating evidence and can NEVER override the football-role count.
+
+STEP 1 — ACCOUNT FOR THE OFFENSE
+Identify/count the five true offensive linemen and return offensive_lineman_count.
+Identify/count the quarterback and return quarterback_count.
+Then return EXACTLY five eligible_players.
+
+STEP 2 — TRACK THE SAME FIVE ELIGIBLE PLAYERS THROUGH THE ENTIRE PRE-SNAP SEQUENCE
+For each eligible player, record:
+
+initial_slot:
+Use the EARLIEST SETTLED alignment and choose one canonical slot:
+- Backfield 1
+- Backfield 2
+- Left wide
+- Left slot
+- Left core/attached
+- Right core/attached
+- Right slot
+- Right wide
+- Other
+- Unknown
+
+Use OFFENSIVE left/right, not where the player happens to finish after a shift.
+
+visual_role:
+Classify the player's football identity from the WHOLE pre-snap sequence:
+- RB/FB
+- TE/H-back
+- WR
+- Unknown
+
+ROLE RULES:
+- A player who begins beside/behind the QB as a true back remains RB/FB even if he shifts wide.
+- A true TE/H-back who begins attached, wing, or core remains TE/H-back if he later flexes.
+- A player who begins as a normal split receiver/slot and functions as a receiver remains WR.
+- Final alignment does not change personnel identity.
+- If role evidence is genuinely ambiguous, use Unknown instead of guessing.
+
+jersey_number / jersey_readability:
+- Read a jersey only if actually visible.
+- Clear = genuinely readable digits.
+- Partial = incomplete/uncertain digits.
+- Unreadable = cannot responsibly identify.
+- Do NOT infer a number because it exists on the roster.
+- Do NOT change visual_role to make it agree with a jersey lookup.
+
+initial_alignment / final_alignment:
+Describe where the same player begins and ends before the snap.
+
+identity_evidence:
+Briefly explain why the visual_role was chosen.
+
+Do NOT return personnel shorthand.
+Do NOT chart formation, motion, play type, defense, pressure, or coverage.
+Python will derive each run's personnel code from the five visual_role values, then take a 2-of-3
+consensus across three runs. Jersey consistency is recorded only as a diagnostic.
+"""
 
 
 def _hybrid_personnel_prompt_v45(play_context: dict) -> str:
@@ -1690,6 +1809,136 @@ def _normalize_jersey_v44(value) -> Optional[str]:
 
 
 
+
+
+def _derive_visual_personnel_v46(
+    personnel_pass: PersonnelConsensusPassV46,
+    roster: list[dict],
+) -> tuple[str, dict]:
+    """
+    Derive personnel from visual roles only.
+
+    Jersey/roster evidence is captured for diagnostics but never changes the role used
+    for personnel. A run is valid only with 5 OL, 1 QB, five known visual roles, and
+    internally complete eligible-player accounting.
+    """
+    by_jersey: dict[str, list[dict]] = {}
+    for item in roster:
+        jersey = _normalize_jersey_v44(item.get("jersey"))
+        role = item.get("role")
+        if jersey and role in {"RB/FB", "TE/H-back", "WR"}:
+            by_jersey.setdefault(jersey, []).append(item)
+
+    observed_players = []
+    for visible in personnel_pass.eligible_players:
+        jersey = _normalize_jersey_v44(visible.jersey_number)
+        matches = by_jersey.get(jersey, []) if jersey else []
+        roster_roles = sorted({item.get("role") for item in matches if item.get("role")})
+        roster_role = roster_roles[0] if len(roster_roles) == 1 else None
+        matched_name = matches[0].get("name") if len(matches) == 1 else None
+        matched_position = matches[0].get("position") if len(matches) == 1 else None
+
+        observed_players.append(
+            {
+                "player_label": visible.player_label,
+                "initial_slot": visible.initial_slot,
+                "jersey": jersey,
+                "jersey_readability": visible.jersey_readability,
+                "visual_role": visible.visual_role,
+                "roster_role": roster_role,
+                "jersey_visual_agree": (
+                    roster_role == visible.visual_role
+                    if roster_role and visible.visual_role != "Unknown"
+                    else None
+                ),
+                "matched_name": matched_name,
+                "roster_position": matched_position,
+                "roster_match_count": len(matches),
+                "initial_alignment": visible.initial_alignment,
+                "final_alignment": visible.final_alignment,
+                "identity_evidence": visible.identity_evidence,
+            }
+        )
+
+    roles = [item["visual_role"] for item in observed_players]
+    rb_count = sum(role == "RB/FB" for role in roles)
+    te_count = sum(role == "TE/H-back" for role in roles)
+    wr_count = sum(role == "WR" for role in roles)
+    unknown_count = sum(role == "Unknown" for role in roles)
+
+    valid_accounting = (
+        personnel_pass.offensive_lineman_count == 5
+        and personnel_pass.quarterback_count == 1
+        and len(observed_players) == 5
+        and unknown_count == 0
+        and (rb_count + te_count + wr_count) == 5
+    )
+
+    if valid_accounting:
+        code = f"{rb_count}{te_count}"
+        standard = {"00", "01", "02", "10", "11", "12", "13", "20", "21", "22", "23", "30", "31", "32"}
+        personnel = code if code in standard else "Other"
+    else:
+        personnel = "Unknown"
+
+    audit = {
+        "offensive_lineman_count": personnel_pass.offensive_lineman_count,
+        "quarterback_count": personnel_pass.quarterback_count,
+        "eligible_player_count": len(observed_players),
+        "rb_fb_count": rb_count,
+        "te_hback_count": te_count,
+        "wr_count": wr_count,
+        "unknown_eligible_count": unknown_count,
+        "valid_accounting": valid_accounting,
+        "eligible_players": observed_players,
+        "notes": personnel_pass.notes,
+        "confidence": personnel_pass.confidence,
+    }
+    return personnel, audit
+
+
+def _jersey_corroboration_v46(audits: list[dict]) -> list[dict]:
+    """
+    Show whether a jersey read is corroborated at the same canonical initial slot.
+
+    This is diagnostic only; it does not affect personnel.
+    """
+    by_slot: dict[str, list[dict]] = {}
+    for run_index, audit in enumerate(audits, start=1):
+        for player in audit.get("eligible_players") or []:
+            slot = player.get("initial_slot") or "Unknown"
+            by_slot.setdefault(slot, []).append(
+                {
+                    "run": run_index,
+                    "jersey": player.get("jersey"),
+                    "readability": player.get("jersey_readability"),
+                    "visual_role": player.get("visual_role"),
+                }
+            )
+
+    rows = []
+    for slot, observations in sorted(by_slot.items()):
+        clear_jerseys = [
+            item["jersey"]
+            for item in observations
+            if item.get("readability") == "Clear" and item.get("jersey")
+        ]
+        counts = {}
+        for jersey in clear_jerseys:
+            counts[jersey] = counts.get(jersey, 0) + 1
+        ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        corroborated = ranked[0][0] if ranked and ranked[0][1] >= 2 else None
+        rows.append(
+            {
+                "initial_slot": slot,
+                "corroborated_jersey": corroborated,
+                "clear_jersey_votes": ranked,
+                "observations": observations,
+            }
+        )
+    return rows
+
+
 def _derive_hybrid_personnel_v45(
     personnel_pass: HybridPersonnelPassV45,
     roster: list[dict],
@@ -2137,6 +2386,198 @@ def analyze_clip_gemini(
 
 
 
+
+
+
+
+def analyze_clip_gemini_v46_personnel_consensus(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4.6: five unchanged V1 full-chart calls plus deterministic 3-run visual-personnel consensus.
+
+    Each specialist run derives a personnel code from five visual player roles only. Final personnel
+    is a 2-of-3 vote across those codes. Jersey/roster evidence is diagnostic and cannot override roles.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    roster = play_context.get("offense_skill_roster") or []
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        full_runs: list[dict] = []
+        for run_index in range(5):
+            chart = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _prompt(play_context),
+                FootballSnapChart,
+            )
+            full_runs.append(chart.model_dump())
+            if run_index < 4:
+                time.sleep(2)
+
+        chart_fields = [
+            name
+            for name in FootballSnapChart.model_fields
+            if name not in {"overall_confidence", "uncertain_fields", "analysis_notes"}
+        ]
+
+        result = {}
+        stability = {}
+        no_majority_fields = []
+        unanimous_fields = []
+        strong_majority_fields = []
+
+        for field in chart_fields:
+            values = [run.get(field) for run in full_runs]
+            consensus, top_count, vote_counts, has_majority = _majority_vote_v41(values)
+            result[field] = consensus
+            stability[field] = {
+                "top_count": top_count,
+                "run_count": len(full_runs),
+                "agreement": top_count / len(full_runs),
+                "has_majority": has_majority,
+                "vote_counts": vote_counts,
+                "source": "v1-full-chart",
+            }
+            if top_count == len(full_runs):
+                unanimous_fields.append(field)
+            elif top_count >= 4:
+                strong_majority_fields.append(field)
+            if not has_majority:
+                no_majority_fields.append(field)
+
+        personnel_runs = []
+        personnel_audits = []
+        for run_index in range(3):
+            personnel_pass = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _personnel_consensus_prompt_v46(play_context),
+                PersonnelConsensusPassV46,
+            )
+            personnel, audit = _derive_visual_personnel_v46(personnel_pass, roster)
+            personnel_runs.append(personnel)
+            personnel_audits.append(audit)
+            if run_index < 2:
+                time.sleep(2)
+
+        # True 2-of-3 vote on the per-run visual personnel codes.
+        counts = {}
+        first_order = []
+        for value in personnel_runs:
+            key = _repeatability_vote_key_v41(value)
+            if key not in counts:
+                counts[key] = {"count": 0, "value": value}
+                first_order.append(key)
+            counts[key]["count"] += 1
+
+        ranked_keys = sorted(first_order, key=lambda key: counts[key]["count"], reverse=True)
+        personnel_votes = [
+            {"value": counts[key]["value"], "count": counts[key]["count"]}
+            for key in ranked_keys
+        ]
+        top = personnel_votes[0] if personnel_votes else None
+        if top and top["count"] >= 2 and top["value"] not in {None, "Unknown"}:
+            personnel_consensus = top["value"]
+            personnel_has_majority = True
+        else:
+            personnel_consensus = None
+            personnel_has_majority = False
+
+        result["personnel"] = personnel_consensus
+        stability["personnel"] = {
+            "top_count": top["count"] if top else 0,
+            "run_count": 3,
+            "agreement": (top["count"] / 3) if top else 0.0,
+            "has_majority": personnel_has_majority,
+            "vote_counts": personnel_votes,
+            "source": "three-run-visual-personnel-consensus",
+        }
+
+        if "personnel" in no_majority_fields:
+            no_majority_fields.remove("personnel")
+        if not personnel_has_majority:
+            no_majority_fields.append("personnel")
+
+        confidences = [
+            float(run["overall_confidence"])
+            for run in full_runs
+            if run.get("overall_confidence") is not None
+        ]
+        result["overall_confidence"] = (
+            sum(confidences) / len(confidences) if confidences else 0.0
+        )
+
+        uncertain = []
+        for run in full_runs:
+            for field in run.get("uncertain_fields") or []:
+                if field not in uncertain:
+                    uncertain.append(field)
+        for field in no_majority_fields:
+            if field not in uncertain:
+                uncertain.append(field)
+        if result.get("personnel") is None and "personnel" not in uncertain:
+            uncertain.append("personnel")
+        result["uncertain_fields"] = uncertain
+
+        valid_personnel_runs = sum(
+            bool(audit.get("valid_accounting")) for audit in personnel_audits
+        )
+        jersey_corroboration = _jersey_corroboration_v46(personnel_audits)
+
+        result["analysis_notes"] = (
+            "V4.6 uses five unchanged V1 full-chart calls plus three personnel-only visual-role "
+            f"observations. {valid_personnel_runs}/3 specialist runs had complete visual accounting. "
+            "Final personnel is a 2-of-3 vote on visual personnel codes; jersey reads are diagnostics only."
+        )
+
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v4.6-personnel-consensus"
+        result["_repeatability"] = {
+            "run_count": 5,
+            "consensus_rule": "At least 3 of 5 identical values for full-chart fields",
+            "runs": full_runs,
+            "stability": stability,
+            "unanimous_fields": unanimous_fields,
+            "strong_majority_fields": strong_majority_fields,
+            "no_majority_fields": no_majority_fields,
+        }
+        result["_personnel_accounting"] = {
+            "method": "Three-run visual-role personnel consensus; jersey/roster is corroborating diagnostic only",
+            "run_count": 3,
+            "consensus_rule": "At least 2 of 3 visual personnel codes",
+            "valid_runs": valid_personnel_runs,
+            "personnel_runs": personnel_runs,
+            "votes": personnel_votes,
+            "jersey_corroboration": jersey_corroboration,
+            "roster": roster,
+            "runs": personnel_audits,
+        }
+        return result
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_gemini_v45_hybrid_personnel(
