@@ -86,6 +86,18 @@ class FootballSnapChartV42(FootballSnapChart):
     personnel_accounting_notes: str = ""
 
 
+
+
+class MechanicalPersonnelPassV43(BaseModel):
+    """Personnel-only accounting pass, isolated from the full chart."""
+
+    offensive_lineman_count: int = Field(ge=0, le=7)
+    quarterback_count: int = Field(ge=0, le=2)
+    eligible_players: list[EligibleSkillPlayerV42] = Field(min_length=5, max_length=5)
+    confidence: float = Field(ge=0, le=1)
+    notes: str = ""
+
+
 class NativeCorrectionV4(BaseModel):
     """Narrow second native-video pass for fields where V1 historically underperforms."""
 
@@ -523,6 +535,56 @@ IMPORTANT:
 """
 
 
+
+
+
+
+def _mechanical_personnel_prompt_v43(play_context: dict) -> str:
+    context = _context(play_context)
+    return f"""
+You are doing ONLY offensive personnel accounting for one college football snap.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Do NOT chart formation, motion, shift, play type, defense, pressure, or coverage.
+Your only job is to account for the 11 offensive players mechanically.
+
+STEP 1 — TRUE OFFENSIVE LINEMEN
+Identify the five true offensive linemen by role/body/alignment:
+LT, LG, C, RG, RT.
+Return offensive_lineman_count.
+Do NOT count a WR who is on the line of scrimmage as an offensive lineman.
+
+STEP 2 — QUARTERBACK
+Identify the quarterback and return quarterback_count.
+Normally this should be exactly 1.
+
+STEP 3 — THE FIVE REMAINING ELIGIBLE PLAYERS
+After the OL and QB are accounted for, return exactly five eligible_players.
+Classify each one as exactly one of:
+- RB/FB
+- TE/H-back
+- WR
+- Unknown
+
+Personnel identity follows the PLAYER, not his final alignment.
+Examples:
+- A RB who starts beside the QB and shifts to the slot is still RB/FB.
+- A TE who flexes wide is still TE/H-back.
+- A WR aligned on the LOS is still WR.
+- A wing/H-back with TE body/role is TE/H-back.
+
+Watch the full pre-snap sequence so you can track a player who changes alignment.
+
+Use generic labels such as "RB #1", "attached Y", "field slot", "boundary WR".
+If one player's identity is genuinely unclear, mark only that player Unknown.
+
+The correct accounting should be:
+5 OL + 1 QB + 5 eligible players = 11 offensive players.
+
+Do not return personnel shorthand. Python will derive it from the five eligible-player identities.
+"""
 
 
 def _prompt_v42_mechanical_personnel(play_context: dict) -> str:
@@ -1419,6 +1481,50 @@ def _pass_confidence_average(*passes: BaseModel) -> float:
 
 
 
+
+
+def _derive_personnel_from_accounting_v43(
+    offensive_lineman_count: int,
+    quarterback_count: int,
+    eligible_players: list[EligibleSkillPlayerV42],
+    notes: str = "",
+) -> tuple[str, dict]:
+    roles = [player.role for player in eligible_players]
+    rb_count = sum(role == "RB/FB" for role in roles)
+    te_count = sum(role == "TE/H-back" for role in roles)
+    wr_count = sum(role == "WR" for role in roles)
+    unknown_count = sum(role == "Unknown" for role in roles)
+
+    valid_accounting = (
+        offensive_lineman_count == 5
+        and quarterback_count == 1
+        and len(roles) == 5
+        and unknown_count == 0
+        and (rb_count + te_count + wr_count) == 5
+    )
+
+    if valid_accounting:
+        code = f"{rb_count}{te_count}"
+        standard = {"00", "01", "02", "10", "11", "12", "13", "20", "21", "22", "23", "30", "31", "32"}
+        personnel = code if code in standard else "Other"
+    else:
+        personnel = "Unknown"
+
+    audit = {
+        "offensive_lineman_count": offensive_lineman_count,
+        "quarterback_count": quarterback_count,
+        "eligible_player_count": len(roles),
+        "rb_fb_count": rb_count,
+        "te_hback_count": te_count,
+        "wr_count": wr_count,
+        "unknown_eligible_count": unknown_count,
+        "valid_accounting": valid_accounting,
+        "eligible_players": [player.model_dump() for player in eligible_players],
+        "notes": notes,
+    }
+    return personnel, audit
+
+
 def _derive_personnel_v42(chart: FootballSnapChartV42) -> tuple[str, dict]:
     """
     Derive personnel only from complete 11-man accounting.
@@ -1615,6 +1721,190 @@ def analyze_clip_gemini(
 
 
 
+
+
+
+
+def analyze_clip_gemini_v43_repeatability_with_personnel_pass(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4.3: five normal V1 full-chart calls plus three isolated mechanical-personnel calls.
+
+    Non-personnel fields come only from the five-run V1 consensus. Personnel is derived
+    only from the separate accounting pass, preventing the personnel prompt from degrading
+    the rest of the chart.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        # Full-chart repeatability: unchanged V1 behavior.
+        full_runs: list[dict] = []
+        for run_index in range(5):
+            chart = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _prompt(play_context),
+                FootballSnapChart,
+            )
+            full_runs.append(chart.model_dump())
+            if run_index < 4:
+                time.sleep(2)
+
+        chart_fields = [
+            name
+            for name in FootballSnapChart.model_fields
+            if name not in {"overall_confidence", "uncertain_fields", "analysis_notes"}
+        ]
+
+        result = {}
+        stability = {}
+        no_majority_fields = []
+        unanimous_fields = []
+        strong_majority_fields = []
+
+        for field in chart_fields:
+            # Personnel will be overwritten by the isolated accounting consensus below.
+            values = [run.get(field) for run in full_runs]
+            consensus, top_count, vote_counts, has_majority = _majority_vote_v41(values)
+            result[field] = consensus
+            agreement = top_count / len(full_runs)
+            stability[field] = {
+                "top_count": top_count,
+                "run_count": len(full_runs),
+                "agreement": agreement,
+                "has_majority": has_majority,
+                "vote_counts": vote_counts,
+                "source": "v1-full-chart",
+            }
+            if top_count == len(full_runs):
+                unanimous_fields.append(field)
+            elif top_count >= 4:
+                strong_majority_fields.append(field)
+            if not has_majority:
+                no_majority_fields.append(field)
+
+        # Isolated personnel accounting: three independent narrow passes.
+        personnel_runs = []
+        personnel_audits = []
+        for run_index in range(3):
+            personnel_pass = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _mechanical_personnel_prompt_v43(play_context),
+                MechanicalPersonnelPassV43,
+            )
+            personnel, audit = _derive_personnel_from_accounting_v43(
+                personnel_pass.offensive_lineman_count,
+                personnel_pass.quarterback_count,
+                personnel_pass.eligible_players,
+                personnel_pass.notes,
+            )
+            personnel_runs.append(personnel)
+            audit["confidence"] = personnel_pass.confidence
+            personnel_audits.append(audit)
+            if run_index < 2:
+                time.sleep(2)
+
+        personnel_consensus, personnel_top_count, personnel_votes, personnel_has_majority = _majority_vote_v41(
+            personnel_runs
+        )
+        # For 3 personnel runs, require a true 2-of-3 majority.
+        if personnel_top_count < 2:
+            personnel_consensus = None
+            personnel_has_majority = False
+
+        result["personnel"] = personnel_consensus
+        stability["personnel"] = {
+            "top_count": personnel_top_count,
+            "run_count": 3,
+            "agreement": personnel_top_count / 3,
+            "has_majority": personnel_has_majority,
+            "vote_counts": personnel_votes,
+            "source": "isolated-mechanical-personnel",
+        }
+
+        if "personnel" in no_majority_fields:
+            no_majority_fields.remove("personnel")
+        if not personnel_has_majority:
+            no_majority_fields.append("personnel")
+
+        confidences = [
+            float(run["overall_confidence"])
+            for run in full_runs
+            if run.get("overall_confidence") is not None
+        ]
+        result["overall_confidence"] = (
+            sum(confidences) / len(confidences) if confidences else 0.0
+        )
+
+        uncertain = []
+        for run in full_runs:
+            for field in run.get("uncertain_fields") or []:
+                if field not in uncertain:
+                    uncertain.append(field)
+        for field in no_majority_fields:
+            if field not in uncertain:
+                uncertain.append(field)
+        if result.get("personnel") in {None, "Unknown"} and "personnel" not in uncertain:
+            uncertain.append("personnel")
+        result["uncertain_fields"] = uncertain
+
+        valid_personnel_runs = sum(
+            bool(audit.get("valid_accounting")) for audit in personnel_audits
+        )
+
+        result["analysis_notes"] = (
+            "V4.3 separates full-chart repeatability from personnel accounting. "
+            "Five unchanged V1 calls determine all non-personnel fields; three isolated "
+            f"personnel-only calls determine personnel. {valid_personnel_runs}/3 personnel "
+            "runs had complete 5 OL + 1 QB + 5 eligible accounting."
+        )
+
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v4.3-repeatability-separated-personnel"
+        result["_repeatability"] = {
+            "run_count": 5,
+            "consensus_rule": "At least 3 of 5 identical values for full-chart fields",
+            "runs": full_runs,
+            "stability": stability,
+            "unanimous_fields": unanimous_fields,
+            "strong_majority_fields": strong_majority_fields,
+            "no_majority_fields": no_majority_fields,
+        }
+        result["_personnel_accounting"] = {
+            "method": "Separate personnel-only pass: 5 OL + 1 QB + 5 eligible identities",
+            "run_count": 3,
+            "consensus_rule": "At least 2 of 3 derived personnel codes",
+            "valid_runs": valid_personnel_runs,
+            "personnel_runs": personnel_runs,
+            "votes": personnel_votes,
+            "runs": personnel_audits,
+        }
+        return result
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_gemini_v42_personnel_repeatability(
