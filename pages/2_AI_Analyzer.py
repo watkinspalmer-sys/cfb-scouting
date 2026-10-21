@@ -352,6 +352,7 @@ def _render_single(
 
     if analyze_clicked:
         try:
+            # Keep analyzer descriptions inside the try block so every branch is valid Python.
             if analyzer_version == "v4.6-personnel-only":
                 passes = "three personnel-only visual-role observations"
             elif analyzer_version == "v4.6-personnel-consensus":
