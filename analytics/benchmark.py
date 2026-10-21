@@ -250,3 +250,19 @@ def field_summary(comparisons: pd.DataFrame) -> pd.DataFrame:
         ascending=[True, True],
     ).reset_index(drop=True)
 
+
+V5_CORE_FIELDS = [
+    "Formation family",
+    "Film play type",
+    "RPO",
+    "Play action",
+    "Front",
+    "Shell",
+]
+
+
+def v5_core_comparison(human: dict, prediction: dict) -> pd.DataFrame:
+    """Compare only the six fields intentionally produced by the V5 Core Analyzer."""
+    comparison = compare_prediction(human, prediction)
+    return comparison[comparison["Field"].isin(V5_CORE_FIELDS)].copy().reset_index(drop=True)
+
