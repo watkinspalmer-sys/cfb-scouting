@@ -11,11 +11,12 @@ from analytics.benchmark import category_summary, compare_prediction, field_summ
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_roster, fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel, analyze_clip_gemini_v46_personnel_consensus
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel, analyze_clip_gemini_v46_personnel_consensus, analyze_clip_gemini_v46_personnel_only
 
 
 ANALYZERS = {
-    "V4.6 deterministic personnel consensus (recommended)": ("v4.6-personnel-consensus", analyze_clip_gemini_v46_personnel_consensus),
+    "V4.6 personnel-only batch validation (recommended)": ("v4.6-personnel-only", analyze_clip_gemini_v46_personnel_only),
+    "V4.6 deterministic personnel consensus": ("v4.6-personnel-consensus", analyze_clip_gemini_v46_personnel_consensus),
     "V4.5 hybrid personnel evidence": ("v4.5-hybrid-personnel", analyze_clip_gemini_v45_hybrid_personnel),
     "V4.4 roster-assisted personnel": ("v4.4-roster-assisted-personnel", analyze_clip_gemini_v44_roster_personnel),
     "V4.3 repeatability + separate personnel pass": ("v4.3-repeatability-separated-personnel", analyze_clip_gemini_v43_repeatability_with_personnel_pass),
@@ -351,7 +352,12 @@ def _render_single(
 
     if analyze_clicked:
         try:
-            if analyzer_version == "v4.6-personnel-consensus":
+            if analyzer_version == "v4.6-personnel-only":
+        st.info(
+            "V4.6 personnel-only batch validation makes exactly 3 specialist calls per play and "
+            "scores only Personnel. The five-run full-chart analyzer is skipped."
+        )
+    elif analyzer_version == "v4.6-personnel-consensus":
                 passes = "five full-chart V1 observations plus three visual-role personnel observations"
             elif analyzer_version == "v4.5-hybrid-personnel":
                 passes = "five full-chart V1 observations plus three hybrid personnel-evidence observations"
@@ -1311,9 +1317,242 @@ def _render_stored_field_analysis(
         )
 
 
+
+
+def _render_personnel_batch_validation(
+    eligible,
+    cfbd_key: str | None,
+    api_key: str,
+    model: str,
+    video_fps: float,
+    use_play_text: bool,
+    analyzer_fn,
+):
+    """Run the V4.6 personnel specialist across all validated plays and score Personnel only."""
+    st.info(
+        "Personnel-only validation: 3 Gemini calls per play. No full-chart V1 calls are made. "
+        "Only the validated Personnel field is scored."
+    )
+
+    run_batch = st.button(
+        f"Run personnel validation on {len(eligible)} plays ({len(eligible) * 3} Gemini calls)",
+        type="primary",
+        key="run_batch_v46_personnel_only",
+    )
+
+    batch_key = f"batch_personnel_only_{model}_{video_fps}_{use_play_text}"
+    if run_batch:
+        summaries = []
+        detail_rows = []
+        errors = []
+        progress = st.progress(0.0, text="Starting personnel-only validation...")
+        status = st.empty()
+
+        for position, (idx, human, clip_path, side) in enumerate(eligible, start=1):
+            label = _play_label(human, idx)
+            status.write(
+                f"Personnel {position}/{len(eligible)} — {label} "
+                f"({side}, 3 specialist calls)"
+            )
+
+            try:
+                try:
+                    extra_context = _v44_roster_context(human, cfbd_key)
+                except Exception:
+                    # Roster data is diagnostic only in V4.6; personnel must still be testable
+                    # from whole-sequence visual roles when roster retrieval is unavailable.
+                    extra_context = {"offense_skill_roster": []}
+
+                prediction = _run_analyzer(
+                    analyzer_fn,
+                    clip_path,
+                    human,
+                    side,
+                    use_play_text,
+                    api_key,
+                    model,
+                    video_fps,
+                    extra_context,
+                )
+
+                comp = compare_prediction(human.to_dict(), prediction)
+                personnel_comp = comp[comp["Field"].eq("Personnel")].copy()
+                if personnel_comp.empty or not bool(personnel_comp.iloc[0]["Scored"]):
+                    human_personnel = _clean(human.get("personnel"), None)
+                    raise ValueError(
+                        f"No validated human personnel label is available for play {human.get('play_id')} "
+                        f"(value={human_personnel!r})."
+                    )
+
+                personnel_row = personnel_comp.iloc[0]
+                is_match = bool(personnel_row["Match"])
+                accounting = prediction.get("_personnel_accounting") or {}
+                runs = list(accounting.get("personnel_runs") or [])
+                votes = list(accounting.get("votes") or [])
+                top_votes = int(votes[0].get("count", 0)) if votes else 0
+                consensus = prediction.get("personnel")
+
+                summaries.append(
+                    {
+                        "Play": position,
+                        "Play ID": _id_text(human.get("play_id")),
+                        "Quarter": _clean(human.get("period"), ""),
+                        "Clock": _clean(human.get("clock"), ""),
+                        "Side": side.title(),
+                        "Human personnel": personnel_row["Human"],
+                        "Run 1": runs[0] if len(runs) > 0 else None,
+                        "Run 2": runs[1] if len(runs) > 1 else None,
+                        "Run 3": runs[2] if len(runs) > 2 else None,
+                        "Consensus": consensus,
+                        "Consensus votes": f"{top_votes}/3" if top_votes else "",
+                        "Valid accounting runs": accounting.get("valid_runs"),
+                        "Correct": is_match,
+                        "AI confidence": prediction.get("overall_confidence"),
+                        "Status": "Success",
+                    }
+                )
+
+                for run_number, audit in enumerate(accounting.get("runs") or [], start=1):
+                    for player in audit.get("eligible_players") or []:
+                        detail_rows.append(
+                            {
+                                "Play": position,
+                                "Play ID": _id_text(human.get("play_id")),
+                                "Side": side.title(),
+                                "Human personnel": personnel_row["Human"],
+                                "Consensus": consensus,
+                                "Correct": is_match,
+                                "Personnel run": run_number,
+                                "Run personnel": runs[run_number - 1] if run_number - 1 < len(runs) else None,
+                                "OL count": audit.get("offensive_lineman_count"),
+                                "QB count": audit.get("quarterback_count"),
+                                "Run RB/FB count": audit.get("rb_fb_count"),
+                                "Run TE/H count": audit.get("te_hback_count"),
+                                "Run WR count": audit.get("wr_count"),
+                                "Run valid": audit.get("valid_accounting"),
+                                "Player label": player.get("player_label"),
+                                "Initial slot": player.get("initial_slot"),
+                                "Visual role": player.get("visual_role"),
+                                "Jersey": player.get("jersey"),
+                                "Jersey readability": player.get("jersey_readability"),
+                                "Roster role": player.get("roster_role"),
+                                "Jersey/visual agree": player.get("jersey_visual_agree"),
+                                "Initial alignment": player.get("initial_alignment"),
+                                "Final alignment": player.get("final_alignment"),
+                                "Identity evidence": player.get("identity_evidence"),
+                            }
+                        )
+
+                save_ai_prediction(
+                    game_id=_id_text(human.get("game_id")),
+                    play_id=_id_text(human.get("play_id")),
+                    model=model.strip(),
+                    analyzer_version="v4.6-personnel-only",
+                    chart_side=side,
+                    prediction=prediction,
+                    score_matches=1 if is_match else 0,
+                    score_total=1,
+                    video_fps=float(video_fps),
+                    use_play_text=bool(use_play_text),
+                )
+
+            except Exception as exc:
+                message = str(exc)
+                errors.append({"Play": label, "Error": message})
+                summaries.append(
+                    {
+                        "Play": position,
+                        "Play ID": _id_text(human.get("play_id")),
+                        "Quarter": _clean(human.get("period"), ""),
+                        "Clock": _clean(human.get("clock"), ""),
+                        "Side": side.title(),
+                        "Human personnel": _clean(human.get("personnel"), None),
+                        "Run 1": None,
+                        "Run 2": None,
+                        "Run 3": None,
+                        "Consensus": None,
+                        "Consensus votes": "",
+                        "Valid accounting runs": None,
+                        "Correct": None,
+                        "AI confidence": None,
+                        "Status": f"Error: {message[:140]}",
+                    }
+                )
+
+            progress.progress(
+                position / len(eligible),
+                text=f"Completed {position}/{len(eligible)} personnel plays",
+            )
+            if position < len(eligible):
+                time.sleep(7)
+
+        st.session_state[batch_key] = {
+            "summary": pd.DataFrame(summaries),
+            "detail": pd.DataFrame(detail_rows),
+            "errors": pd.DataFrame(errors),
+        }
+        status.success("Personnel-only validation finished.")
+
+    result = st.session_state.get(batch_key)
+    if not result:
+        st.info("Run the personnel validation to test the method across the full benchmark.")
+        return
+
+    summary = result["summary"]
+    detail = result["detail"]
+    errors = result["errors"]
+
+    st.divider()
+    st.subheader("V4.6 personnel validation results")
+
+    successful = summary[summary["Status"].eq("Success")].copy()
+    correct = int(successful["Correct"].eq(True).sum()) if not successful.empty else 0
+    scored = int(successful["Correct"].notna().sum()) if not successful.empty else 0
+    accuracy = correct / scored if scored else None
+    consensus_reached = int(successful["Consensus"].notna().sum()) if not successful.empty else 0
+    unanimous = int(successful["Consensus votes"].eq("3/3").sum()) if not successful.empty else 0
+
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Successful plays", f"{len(successful)}/{len(summary)}")
+    v2.metric("Personnel accuracy", f"{correct}/{scored} ({accuracy:.0%})" if accuracy is not None else "—")
+    v3.metric("Consensus reached", f"{consensus_reached}/{len(successful)}" if len(successful) else "—")
+    v4.metric("Unanimous consensus", f"{unanimous}/{len(successful)}" if len(successful) else "—")
+
+    display = summary.copy()
+    display["Correct"] = display["Correct"].map(
+        lambda value: "✅" if value is True else "❌" if value is False else ""
+    )
+    display["AI confidence"] = display["AI confidence"].map(
+        lambda value: f"{value:.0%}" if pd.notna(value) else ""
+    )
+    st.dataframe(display, hide_index=True, use_container_width=True)
+
+    if not errors.empty:
+        with st.expander(f"Personnel validation errors ({len(errors)})"):
+            st.dataframe(errors, hide_index=True, use_container_width=True)
+
+    st.download_button(
+        "Download personnel validation summary CSV",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name="v4.6_personnel_batch_validation.csv",
+        mime="text/csv",
+        key="download_v46_personnel_summary",
+    )
+
+    if not detail.empty:
+        st.download_button(
+            "Download personnel player-role detail CSV",
+            data=detail.to_csv(index=False).encode("utf-8"),
+            file_name="v4.6_personnel_batch_player_detail.csv",
+            mime="text/csv",
+            key="download_v46_personnel_detail",
+        )
+
+
 def _render_batch(
     reviewed: pd.DataFrame,
     side_lookup: dict[str, str],
+    cfbd_key: str | None,
     api_key: str | None,
     model: str,
     video_fps: float,
@@ -1435,6 +1674,18 @@ def _render_batch(
         return
     if not eligible:
         st.info("No benchmark plays are ready for batch analysis.")
+        return
+
+    if analyzer_version == "v4.6-personnel-only":
+        _render_personnel_batch_validation(
+            eligible,
+            cfbd_key,
+            api_key,
+            model,
+            video_fps,
+            use_play_text,
+            analyzer_fn,
+        )
         return
 
     _render_stored_field_analysis(
@@ -1635,8 +1886,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.6 keeps full-snap charting separate from personnel and derives the package from a "
-        "deterministic 2-of-3 consensus of three whole-sequence visual-role observations."
+        "V4.6 personnel batch validation tests the deterministic 2-of-3 visual-role personnel "
+        "method across every validated benchmark play without running the five-call full-chart analyzer."
     )
 
     chart = load_film_chart()
@@ -1659,7 +1910,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use V4.6 on a single snap to test deterministic three-run personnel consensus while preserving five-run V1 repeatability for the rest of the chart.",
+        help="Use the V4.6 personnel-only batch validator to test the three-run personnel method across all validated plays before locking personnel into production.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
@@ -1696,7 +1947,7 @@ def main():
 
     with batch_tab:
         _render_batch(
-            reviewed, side_lookup, api_key, model, video_fps, use_play_text,
+            reviewed, side_lookup, cfbd_key, api_key, model, video_fps, use_play_text,
             analyzer_label, analyzer_version, analyzer_fn,
         )
 
