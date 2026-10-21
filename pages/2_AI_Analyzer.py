@@ -353,11 +353,8 @@ def _render_single(
     if analyze_clicked:
         try:
             if analyzer_version == "v4.6-personnel-only":
-        st.info(
-            "V4.6 personnel-only batch validation makes exactly 3 specialist calls per play and "
-            "scores only Personnel. The five-run full-chart analyzer is skipped."
-        )
-    elif analyzer_version == "v4.6-personnel-consensus":
+                passes = "three personnel-only visual-role observations"
+            elif analyzer_version == "v4.6-personnel-consensus":
                 passes = "five full-chart V1 observations plus three visual-role personnel observations"
             elif analyzer_version == "v4.5-hybrid-personnel":
                 passes = "five full-chart V1 observations plus three hybrid personnel-evidence observations"
