@@ -1231,9 +1231,16 @@ def _shared_play_field_comparison(
     v1 = _stored_version_detail(
         reviewed, "v1-single-pass", model, video_fps, use_play_text
     )
+
+    # A version with no stored predictions returns an empty dataframe with no columns.
+    # Guard that case before attempting any field-level filtering.
+    if current.empty or v1.empty or "Field" not in current.columns or "Field" not in v1.columns:
+        return current, v1, pd.DataFrame()
+
     if current_version == "v5-core":
         current = current[current["Field"].isin(V5_CORE_FIELDS)].copy()
         v1 = v1[v1["Field"].isin(V5_CORE_FIELDS)].copy()
+
     if current.empty or v1.empty:
         return current, v1, pd.DataFrame()
 
