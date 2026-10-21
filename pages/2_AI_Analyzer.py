@@ -7,15 +7,16 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from analytics.benchmark import category_summary, compare_prediction, field_summary, score_prediction
+from analytics.benchmark import V5_CORE_FIELDS, category_summary, compare_prediction, field_summary, score_prediction, v5_core_comparison
 from data.ai_store import load_ai_predictions, save_ai_prediction
 from data.cfbd import fetch_roster, fetch_week_plays
 from data.film_store import load_film_chart
-from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel, analyze_clip_gemini_v46_personnel_consensus, analyze_clip_gemini_v46_personnel_only
+from video.analyze import analyze_clip_gemini, analyze_clip_gemini_v2, analyze_clip_gemini_v21, analyze_clip_gemini_v3, analyze_clip_gemini_v31, analyze_clip_gemini_v32_diagnostic, analyze_clip_gemini_v33, analyze_clip_gemini_v34, analyze_clip_gemini_v4, analyze_clip_gemini_v41_repeatability, analyze_clip_gemini_v42_personnel_repeatability, analyze_clip_gemini_v43_repeatability_with_personnel_pass, analyze_clip_gemini_v44_roster_personnel, analyze_clip_gemini_v45_hybrid_personnel, analyze_clip_gemini_v46_personnel_consensus, analyze_clip_gemini_v46_personnel_only, analyze_clip_gemini_v5_core
 
 
 ANALYZERS = {
-    "V4.6 personnel-only batch validation (recommended)": ("v4.6-personnel-only", analyze_clip_gemini_v46_personnel_only),
+    "V5 Core Scouting Analyzer (recommended)": ("v5-core", analyze_clip_gemini_v5_core),
+    "V4.6 personnel-only batch validation": ("v4.6-personnel-only", analyze_clip_gemini_v46_personnel_only),
     "V4.6 deterministic personnel consensus": ("v4.6-personnel-consensus", analyze_clip_gemini_v46_personnel_consensus),
     "V4.5 hybrid personnel evidence": ("v4.5-hybrid-personnel", analyze_clip_gemini_v45_hybrid_personnel),
     "V4.4 roster-assisted personnel": ("v4.4-roster-assisted-personnel", analyze_clip_gemini_v44_roster_personnel),
@@ -239,8 +240,17 @@ def _v44_roster_context(row: pd.Series, cfbd_key: str | None) -> dict:
     }
 
 
+
+
+def _comparison_for_prediction(human: dict, prediction: dict) -> pd.DataFrame:
+    """Use the analyzer's intended benchmark scope."""
+    if str(prediction.get("_analyzer_version", "")) == "v5-core":
+        return v5_core_comparison(human, prediction)
+    return compare_prediction(human, prediction)
+
+
 def _render_comparison(human: pd.Series, prediction: dict):
-    comparison = compare_prediction(human.to_dict(), prediction)
+    comparison = _comparison_for_prediction(human.to_dict(), prediction)
     matches, total, accuracy = score_prediction(comparison)
 
     m1, m2, m3 = st.columns(3)
@@ -353,7 +363,9 @@ def _render_single(
     if analyze_clicked:
         try:
             # Keep analyzer descriptions inside the try block so every branch is valid Python.
-            if analyzer_version == "v4.6-personnel-only":
+            if analyzer_version == "v5-core":
+                passes = "one six-field native-video core pass"
+            elif analyzer_version == "v4.6-personnel-only":
                 passes = "three personnel-only visual-role observations"
             elif analyzer_version == "v4.6-personnel-consensus":
                 passes = "five full-chart V1 observations plus three visual-role personnel observations"
@@ -1074,7 +1086,13 @@ def _render_single(
         st.json(prediction)
 
 
-def _stored_v1_accuracy(reviewed: pd.DataFrame, model: str, video_fps: float, use_play_text: bool):
+def _stored_v1_accuracy(
+    reviewed: pd.DataFrame,
+    model: str,
+    video_fps: float,
+    use_play_text: bool,
+    core_only: bool = False,
+):
     stored = load_ai_predictions()
     if stored.empty or "prediction_json" not in stored.columns:
         return None
@@ -1112,6 +1130,8 @@ def _stored_v1_accuracy(reviewed: pd.DataFrame, model: str, video_fps: float, us
         except Exception:
             continue
         comp = compare_prediction(human.to_dict(), pred)
+        if core_only:
+            comp = comp[comp["Field"].isin(V5_CORE_FIELDS)].copy()
         m, t, _ = score_prediction(comp)
         matches += m
         total += t
@@ -1202,6 +1222,9 @@ def _shared_play_field_comparison(
     v1 = _stored_version_detail(
         reviewed, "v1-single-pass", model, video_fps, use_play_text
     )
+    if current_version == "v5-core":
+        current = current[current["Field"].isin(V5_CORE_FIELDS)].copy()
+        v1 = v1[v1["Field"].isin(V5_CORE_FIELDS)].copy()
     if current.empty or v1.empty:
         return current, v1, pd.DataFrame()
 
@@ -1725,7 +1748,7 @@ def _render_batch(
                     analyzer_fn, clip_path, human, side, use_play_text,
                     api_key, model, video_fps,
                 )
-                comparison = compare_prediction(human.to_dict(), prediction)
+                comparison = _comparison_for_prediction(human.to_dict(), prediction)
                 matches, total, accuracy = score_prediction(comparison)
                 comparison["play_id"] = _id_text(human.get("play_id"))
                 comparison["clock"] = _clean(human.get("clock"), "")
@@ -1816,9 +1839,17 @@ def _render_batch(
     avg_conf = successful["AI confidence"].dropna().mean() if not successful.empty else None
     b4.metric("Avg. AI confidence", f"{avg_conf:.0%}" if pd.notna(avg_conf) else "—")
 
-    baseline = _stored_v1_accuracy(reviewed, model.strip(), float(video_fps), bool(use_play_text))
-    if analyzer_version in {"v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
+    baseline = _stored_v1_accuracy(
+        reviewed,
+        model.strip(),
+        float(video_fps),
+        bool(use_play_text),
+        core_only=(analyzer_version == "v5-core"),
+    )
+    if analyzer_version in {"v5-core", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
+        if analyzer_version == "v5-core":
+            st.caption("Both scores below use only the same six V5 core fields.")
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "Stored V1 baseline",
@@ -1884,8 +1915,8 @@ def main():
     st.title("AI Analyzer")
     st.caption(
         "Benchmark Gemini video analysis against validated Film Lab data. "
-        "V4.6 personnel batch validation tests the deterministic 2-of-3 visual-role personnel "
-        "method across every validated benchmark play without running the five-call full-chart analyzer."
+        "V5 focuses on the six fields our testing has shown the model can recognize most reliably: "
+        "formation family, run/pass, RPO, play action, defensive front family, and safety shell."
     )
 
     chart = load_film_chart()
@@ -1908,7 +1939,7 @@ def main():
         "Analyzer version",
         options=list(ANALYZERS.keys()),
         index=0,
-        help="Use the V4.6 personnel-only batch validator to test the three-run personnel method across all validated plays before locking personnel into production.",
+        help="Use V5 as the production-candidate benchmark: one native-video call per snap and only six core scouting fields.",
     )
     analyzer_version, analyzer_fn = ANALYZERS[analyzer_label]
 
