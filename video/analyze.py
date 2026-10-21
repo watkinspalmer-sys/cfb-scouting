@@ -2390,6 +2390,116 @@ def analyze_clip_gemini(
 
 
 
+
+
+def analyze_clip_gemini_v46_personnel_only(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V4.6 personnel-only validator: three visual-role personnel observations, no full-chart calls.
+
+    Each run derives personnel from five visual player roles. Final personnel is a true
+    2-of-3 vote. Jersey/roster evidence is retained only as a diagnostic.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    roster = play_context.get("offense_skill_roster") or []
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+
+        personnel_runs = []
+        personnel_audits = []
+        confidences = []
+
+        for run_index in range(3):
+            personnel_pass = _call_structured(
+                client,
+                uploaded,
+                model,
+                fps,
+                _personnel_consensus_prompt_v46(play_context),
+                PersonnelConsensusPassV46,
+            )
+            personnel, audit = _derive_visual_personnel_v46(personnel_pass, roster)
+            personnel_runs.append(personnel)
+            personnel_audits.append(audit)
+            confidences.append(float(personnel_pass.confidence))
+            if run_index < 2:
+                time.sleep(2)
+
+        counts = {}
+        first_order = []
+        for value in personnel_runs:
+            key = _repeatability_vote_key_v41(value)
+            if key not in counts:
+                counts[key] = {"count": 0, "value": value}
+                first_order.append(key)
+            counts[key]["count"] += 1
+
+        ranked_keys = sorted(first_order, key=lambda key: counts[key]["count"], reverse=True)
+        personnel_votes = [
+            {"value": counts[key]["value"], "count": counts[key]["count"]}
+            for key in ranked_keys
+        ]
+        top = personnel_votes[0] if personnel_votes else None
+
+        if top and top["count"] >= 2 and top["value"] not in {None, "Unknown"}:
+            personnel_consensus = top["value"]
+            personnel_has_majority = True
+        else:
+            personnel_consensus = None
+            personnel_has_majority = False
+
+        valid_personnel_runs = sum(
+            bool(audit.get("valid_accounting")) for audit in personnel_audits
+        )
+
+        return {
+            "personnel": personnel_consensus,
+            "overall_confidence": (
+                sum(confidences) / len(confidences) if confidences else 0.0
+            ),
+            "uncertain_fields": [] if personnel_has_majority else ["personnel"],
+            "analysis_notes": (
+                "V4.6 personnel-only validation: three visual-role observations; "
+                f"{valid_personnel_runs}/3 runs had complete accounting. Final personnel uses "
+                "a true 2-of-3 vote. Jersey/roster evidence is diagnostic only."
+            ),
+            "_model": model,
+            "_video_fps": float(fps),
+            "_provider": "google-gemini",
+            "_analyzer_version": "v4.6-personnel-only",
+            "_personnel_accounting": {
+                "method": "Three-run visual-role personnel consensus; jersey/roster is diagnostic only",
+                "run_count": 3,
+                "consensus_rule": "At least 2 of 3 visual personnel codes",
+                "has_majority": personnel_has_majority,
+                "valid_runs": valid_personnel_runs,
+                "personnel_runs": personnel_runs,
+                "votes": personnel_votes,
+                "jersey_corroboration": _jersey_corroboration_v46(personnel_audits),
+                "roster": roster,
+                "runs": personnel_audits,
+            },
+        }
+
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+
 def analyze_clip_gemini_v46_personnel_consensus(
     clip_path: str | Path,
     play_context: dict,
