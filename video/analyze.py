@@ -69,6 +69,23 @@ class FootballSnapChart(BaseModel):
 
 
 
+
+
+class CoreScoutingChartV5(BaseModel):
+    """Small production-oriented schema containing only empirically reliable scouting fields."""
+
+    formation_family: Literal["Gun", "Pistol", "Under Center", "Goalline", "Other", "Unknown"]
+    film_play_type: Literal["Run", "Pass", "Unknown"]
+    rpo: bool
+    play_action: bool
+    front: Literal["Even", "Odd", "Bear", "Mint/Tite", "Other", "Unknown"]
+    shell: Literal["1-High", "2-High", "0-High", "Unknown"]
+
+    overall_confidence: float = Field(ge=0, le=1)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    analysis_notes: str = ""
+
+
 class EligibleSkillPlayerV42(BaseModel):
     """One of the five non-QB, non-OL eligible offensive players."""
 
@@ -623,6 +640,77 @@ IMPORTANT:
 
 
 
+
+
+
+
+def _core_scouting_prompt_v5(play_context: dict) -> str:
+    context = _context(play_context)
+    return f"""
+You are charting ONE college football snap for a scouting database.
+
+Game context:
+{json.dumps(context, indent=2)}
+
+Return ONLY these six football observations. Do not attempt personnel, receiver distribution,
+backfield alignment, motion, shift, box count, coverage, blitz, rusher count, or play concept.
+
+1. formation_family
+Identify the quarterback/offensive formation family:
+- Gun
+- Pistol
+- Under Center
+- Goalline
+- Other
+- Unknown
+
+Do not use personnel or receiver distribution to decide formation family.
+
+2. film_play_type
+Classify the actual snap as:
+- Run
+- Pass
+- Unknown
+
+For this field, classify by what the offense actually executes after the snap.
+Do not use the play-by-play text as the authority for the film label.
+
+3. rpo
+True only when the play visibly combines a run action with a real quarterback read/pass option.
+Do not call every shotgun handoff or play-action pass an RPO.
+
+4. play_action
+True only when the quarterback clearly sells/fakes a handoff or run action before a pass.
+A genuine RPO is not automatically play action.
+
+5. front
+Classify the defensive front family only:
+- Even
+- Odd
+- Bear
+- Mint/Tite
+- Other
+- Unknown
+
+Use the defensive line/front structure, not linebacker count or total box count.
+If the structure is not visually supportable, return Unknown.
+
+6. shell
+Identify the pre-snap safety shell only:
+- 1-High
+- 2-High
+- 0-High
+- Unknown
+
+Use the clearest pre-snap picture immediately before the snap. Do not infer post-snap coverage.
+
+IMPORTANT:
+- This is intentionally a SMALL schema. Focus only on these six fields.
+- Prefer Unknown over guessing.
+- The CFBD context may describe the result, but it is not ground truth for the visual labels.
+- uncertain_fields may contain only these six field names.
+- analysis_notes should be brief and mention only genuine visual ambiguity.
+"""
 
 
 def _personnel_consensus_prompt_v46(play_context: dict) -> str:
@@ -2390,6 +2478,56 @@ def analyze_clip_gemini(
 
 
 
+
+
+
+
+def analyze_clip_gemini_v5_core(
+    clip_path: str | Path,
+    play_context: dict,
+    api_key: str,
+    model: str = "gemini-3.1-flash-lite",
+    fps: float = 5.0,
+) -> dict:
+    """
+    V5: one native-video call returning only six empirically reliable scouting fields.
+    """
+    source = Path(clip_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"Clip not found: {source}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = None
+    try:
+        uploaded = _upload_video(client, source)
+        chart = _call_structured(
+            client,
+            uploaded,
+            model,
+            fps,
+            _core_scouting_prompt_v5(play_context),
+            CoreScoutingChartV5,
+        )
+        result = chart.model_dump()
+        result["_model"] = model
+        result["_video_fps"] = float(fps)
+        result["_provider"] = "google-gemini"
+        result["_analyzer_version"] = "v5-core"
+        result["_core_fields"] = [
+            "formation_family",
+            "film_play_type",
+            "rpo",
+            "play_action",
+            "front",
+            "shell",
+        ]
+        return result
+    finally:
+        if uploaded is not None and uploaded.name:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_clip_gemini_v46_personnel_only(
