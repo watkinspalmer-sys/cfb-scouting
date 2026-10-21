@@ -1120,6 +1120,7 @@ def _stored_v1_accuracy(
 
     human_by_play = {_id_text(row.get("play_id")): row for _, row in reviewed.iterrows()}
     matches = total = plays = 0
+    scored_play_ids = []
     for _, stored_row in candidates.iterrows():
         play_id = _id_text(stored_row.get("play_id"))
         human = human_by_play.get(play_id)
@@ -1136,10 +1137,18 @@ def _stored_v1_accuracy(
         matches += m
         total += t
         plays += 1
+        if t:
+            scored_play_ids.append(play_id)
 
     if not total:
         return None
-    return {"plays": plays, "matches": matches, "total": total, "accuracy": matches / total}
+    return {
+        "plays": plays,
+        "matches": matches,
+        "total": total,
+        "accuracy": matches / total,
+        "play_ids": scored_play_ids,
+    }
 
 
 
@@ -1605,7 +1614,12 @@ def _render_batch(
     m3.metric("Analyzer", analyzer_version)
     m4.metric("Model", model)
 
-    if analyzer_version == "v4.6-personnel-consensus":
+    if analyzer_version == "v5-core":
+        st.info(
+            "V5 is the simplified production candidate: 1 native-video Gemini call per snap. "
+            "The benchmark scores only Formation family, Run/Pass, RPO, Play action, Front, and Shell."
+        )
+    elif analyzer_version == "v4.6-personnel-consensus":
         st.info(
             "V4.6 is a SINGLE-SNAP diagnostic. It keeps five unchanged V1 full-chart calls and uses "
             "three separate personnel passes. Final personnel is a deterministic 2-of-3 vote on visual "
@@ -1848,16 +1862,38 @@ def _render_batch(
     )
     if analyzer_version in {"v5-core", "v4.3-repeatability-separated-personnel", "v4.2-mechanical-personnel-repeatability", "v4.1-repeatability", "v4-native-corrective", "v3.4-snap-centered", "v3.3-two-pass-temporal", "v3.2-temporal-diagnostic", "v3.1-temporal-frames", "v3-temporal-evidence", "v2-specialized", "v2.1-mechanical"} and baseline is not None and overall_accuracy is not None:
         st.subheader("V1 vs current analyzer")
+
+        comparison_accuracy = overall_accuracy
+        comparison_matches = total_matches
+        comparison_total = total_scored
+        comparison_plays = len(successful)
+
         if analyzer_version == "v5-core":
-            st.caption("Both scores below use only the same six V5 core fields.")
+            shared_ids = set(map(str, baseline.get("play_ids") or []))
+            shared_detail = detail[detail["play_id"].astype(str).isin(shared_ids)].copy()
+            shared_matches, shared_total, shared_accuracy = score_prediction(shared_detail)
+            if shared_accuracy is not None:
+                comparison_accuracy = shared_accuracy
+                comparison_matches = shared_matches
+                comparison_total = shared_total
+                comparison_plays = shared_detail["play_id"].astype(str).nunique()
+            st.caption(
+                f"Apples-to-apples: both scores use only the six V5 core fields on the "
+                f"{comparison_plays} play(s) with stored V1 results."
+            )
+
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "Stored V1 baseline",
             f"{baseline['accuracy']:.0%}",
             help=f"{baseline['matches']}/{baseline['total']} across {baseline['plays']} stored plays",
         )
-        c2.metric(analyzer_version, f"{overall_accuracy:.0%}")
-        c3.metric("Change", f"{overall_accuracy - baseline['accuracy']:+.1%}")
+        c2.metric(
+            analyzer_version,
+            f"{comparison_accuracy:.0%}",
+            help=f"{comparison_matches}/{comparison_total} on {comparison_plays} shared plays",
+        )
+        c3.metric("Change", f"{comparison_accuracy - baseline['accuracy']:+.1%}")
 
     table = summary.copy()
     table["Accuracy"] = table["Accuracy"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "")
@@ -1954,7 +1990,7 @@ def main():
         max_value=5.0,
         value=5.0,
         step=0.5,
-        help="Used by V1/V2/V4 native-video analysis. V3-family still-frame analyzers ignore this where noted.",
+        help="Used by V1/V2/V4/V5 native-video analysis. V3-family still-frame analyzers ignore this where noted.",
     )
     use_play_text = st.checkbox(
         "Give the model CFBD play-by-play context",
